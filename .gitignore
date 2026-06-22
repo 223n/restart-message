@@ -1,0 +1,39 @@
+# ---- Go ----
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+go.work.sum
+vendor/
+
+# Build output
+/bin/
+/dist/
+/build/
+
+# ---- Secrets / local config ----
+# The real config holds the Discord webhook URL — never commit it.
+config.json
+config.yaml
+config.yml
+.env
+*.local.json
+secrets.*
+
+# ---- Logs ----
+*.log
+/logs/
+
+# ---- OS ----
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---- Editors / IDE ----
+.vscode/
+.idea/
+*.swp
