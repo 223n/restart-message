@@ -1,21 +1,27 @@
 # restart-message
 
 Windows が再起動した際（Windows Update・手動・予期しないシャットダウンなど）に、
-起動時へ Discord の Webhook で通知を送る軽量ツールです。
+Discord の Webhook で通知を送る軽量ツールです。次の 2 つの通知に対応します。
+
+- **起動時（復帰時）通知**: タスクスケジューラで起動時に検知し通知（取りこぼしの安全網）
+- **シャットダウン前通知**: Windows サービスでシャットダウン/再起動の開始時に通知
+
+主な構成:
 
 - 言語: **Go**（単一バイナリ・ランタイム不要）
-- 起動契機: **タスクスケジューラ**（起動時トリガー、SYSTEM 実行）
 - 検知方式: **Windows イベントログ**（System ログをネイティブ API で直接読取）
 - 通知先: **Discord Webhook**
 
 ## 特徴
 
-- 外部依存ライブラリゼロ（Go 標準ライブラリ + `wevtapi.dll` のみ）。
+- 依存は最小限。イベントログ読取・Discord 送信は Go 標準ライブラリ + `wevtapi.dll`、
+  サービス制御のみ `golang.org/x/sys` を使用。
 - イベントログを `wevtutil` / PowerShell 経由ではなくネイティブ API で読むため、
   日本語などの非 ASCII 文字が文字化けしません。
 - 再起動の理由を**ロケール非依存**のシグナル（シャットダウン理由コード等）で判定。
 - 状態ファイルで多重通知を防止（1 回の起動につき 1 通）。
 - 起動直後でネットワーク未確立でも、送信を自動リトライ。
+- 通知の URL（Webhook の秘密トークン）をログやエラー出力に出しません。
 
 ## 検知できる種別
 
@@ -34,7 +40,7 @@ Windows が再起動した際（Windows Update・手動・予期しないシャ�
 ## 必要要件
 
 - Windows 10 / 11
-- ビルド時のみ: Go 1.22 以降
+- ビルド時のみ: Go 1.25 以降
 
 ## ビルド
 
@@ -73,6 +79,7 @@ go build -trimpath -ldflags "-s -w" -o bin\restart-message.exe .
 | `mention` | 先頭に付けるメンション（例: `<@&ロールID>`、`@here`） |
 | `notify_on` | 通知する種別。空配列または未指定で全種別 |
 | `include_downtime` | ダウンタイム（前回停止〜起動）を含めるか |
+| `notify_shutdown_start` | シャットダウン前通知（サービス）を有効にするか（既定 true） |
 
 ### 設定ファイルの探索順
 
@@ -94,12 +101,16 @@ Webhook URL は環境変数 `DISCORD_WEBHOOK_URL` でも上書きできます。
 ```text
 restart-message <command> [options]
 
-  run        再起動を検知し、未通知なら Discord に通知（タスク用）
-  test       設定された Webhook にテスト通知を送る
-  status     検知結果を表示するだけ（送信しない）
-  install    起動時に run を実行するタスクを登録（要管理者権限）
-  uninstall  登録したタスクを削除（要管理者権限）
-  version    バージョン表示
+  run               再起動を検知し、未通知なら Discord に通知（タスク用）
+  test              設定された Webhook にテスト通知を送る
+  status            検知結果を表示するだけ（送信しない）
+  install           起動時に run を実行するタスクを登録（要管理者権限）
+  uninstall         登録したタスクを削除（要管理者権限）
+  service           Windows サービスとして実行（SCM から起動）
+  install-service   シャットダウン前通知のサービスを登録（要管理者権限）
+  uninstall-service 上記サービスを削除（要管理者権限）
+  shutdown-notice   シャットダウン前通知を手動で1回送る（動作確認用）
+  version           バージョン表示
 
 共通オプション:
   -config <path>   設定ファイルのパス
@@ -118,7 +129,10 @@ restart-message <command> [options]
 .\bin\restart-message.exe test
 ```
 
-## インストール（自動起動の登録）
+## 起動時（復帰時）通知のインストール
+
+再起動後に「PC が起動した／どんな理由で再起動したか」を通知します。
+予期しないシャットダウンや強制終了も後追いで検知できる**安全網**です。
 
 1. `config.json` を `%ProgramData%\restart-message\` に配置（SYSTEM から読めます）。
 2. 管理者権限の PowerShell で登録:
@@ -140,6 +154,40 @@ pwsh -File scripts/install-task.ps1
 ```powershell
 .\bin\restart-message.exe uninstall
 ```
+
+## シャットダウン前通知のインストール（サービス）
+
+シャットダウン/再起動の**開始時**に「まもなく落ちます」を通知します。
+Windows サービスとして常駐し、SCM の **PRESHUTDOWN** 通知（既定で約 3 分の猶予、
+ネットワークは通常まだ有効）を受けて送信します。
+
+```powershell
+# 管理者権限の PowerShell で
+.\bin\restart-message.exe install-service
+```
+
+- サービス名: `restart-message-svc`（自動起動・LocalSystem）
+- 通知後はすぐ終了し、シャットダウンを長く止めません（短いタイムアウト＋少数回リトライ）
+- 直前の Event 1074 から種別（Windows Update / 手動 等）も付記（取得できた場合）
+
+事前の動作確認（実際に再起動せずに 1 回送る）:
+
+```powershell
+.\bin\restart-message.exe shutdown-notice
+```
+
+アンインストール:
+
+```powershell
+.\bin\restart-message.exe uninstall-service
+```
+
+> **注意（割り込みの限界）:** 電源喪失・バッテリ切れ・ブルースクリーン・
+> `shutdown /f` などの強制終了では、シャットダウン前に割り込めません。
+> これらは上記の「起動時（復帰時）通知」が安全網として後追いで検知します。
+> 両方を有効にしておくことを推奨します。
+
+ログ: サービスの動作は `%ProgramData%\restart-message\service.log` に記録されます。
 
 ## 通知される情報
 
@@ -168,7 +216,8 @@ go vet ./...
 ```text
 restart-message/
 ├─ main.go                     エントリポイント / サブコマンド / 表示整形
-├─ task_windows.go             install / uninstall（タスク登録）
+├─ task_windows.go             install / uninstall（起動時タスク登録）
+├─ service_windows.go          service / install-service（シャットダウン前通知）
 ├─ internal/
 │  ├─ winevent/                Windows イベントログ読取（wevtapi.dll）
 │  ├─ detect/                  再起動種別の判定（+ テスト）

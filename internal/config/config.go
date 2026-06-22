@@ -16,14 +16,19 @@ type Config struct {
 	Mention         string   `json:"mention"`          // e.g. "<@&ROLE_ID>", "@here" — prepended as message content
 	NotifyOn        []string `json:"notify_on"`        // categories to notify on; empty means all
 	IncludeDowntime bool     `json:"include_downtime"` // include downtime field in the embed
+
+	// NotifyShutdownStart enables the pre-shutdown notice sent by the service
+	// (restart-message service) when Windows begins shutting down/restarting.
+	NotifyShutdownStart bool `json:"notify_shutdown_start"`
 }
 
 // Default returns the built-in defaults (notify on every category).
 func Default() *Config {
 	return &Config{
-		Username:        "Restart Notifier",
-		NotifyOn:        []string{"update", "manual", "shutdown", "unexpected", "crash", "unknown"},
-		IncludeDowntime: true,
+		Username:            "Restart Notifier",
+		NotifyOn:            []string{"update", "manual", "shutdown", "unexpected", "crash", "unknown"},
+		IncludeDowntime:     true,
+		NotifyShutdownStart: true,
 	}
 }
 

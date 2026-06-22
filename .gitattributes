@@ -1,0 +1,11 @@
+# Normalize line endings. Text files are stored as LF in the repository and
+# checked out as LF, so gofmt stays happy and there is no CRLF churn.
+* text=auto eol=lf
+
+# Windows-oriented scripts conventionally use CRLF.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Treat build artifacts as binary.
+*.exe binary

@@ -190,6 +190,40 @@ func Latest(records []winevent.Record) (*Result, bool) {
 	return res, true
 }
 
+// PendingShutdown classifies an in-progress shutdown/restart from the most
+// recent Event 1074, for use at pre-shutdown time (there is no boot event yet).
+// It returns false when no 1074 was logged within recent of now, so the caller
+// can fall back to a generic "shutting down" notice rather than report a stale
+// reason from an earlier shutdown.
+func PendingShutdown(records []winevent.Record, now time.Time, recent time.Duration) (*Result, bool) {
+	e := findFirst(records, func(r *winevent.Record) bool {
+		return r.EventID == 1074
+	})
+	if e == nil {
+		return nil, false
+	}
+	if now.Sub(e.Time) > recent || e.Time.After(now.Add(2*time.Minute)) {
+		return nil, false // too old (previous shutdown) or implausibly future
+	}
+	res := &Result{
+		Computer:     e.Computer,
+		Process:      e.Data["param1"],
+		User:         e.Data["param7"],
+		ShutdownType: e.Data["param5"],
+		ReasonText:   e.Data["param3"],
+		ReasonCode:   parseHex(e.Data["param4"]),
+	}
+	switch {
+	case isPowerOff(e):
+		res.Category = CatShutdown
+	case isUpdate(e):
+		res.Category = CatUpdate
+	default:
+		res.Category = CatManual
+	}
+	return res, true
+}
+
 func isUpdate(e *winevent.Record) bool {
 	proc := strings.ToLower(e.Data["param1"])
 	for _, marker := range []string{
