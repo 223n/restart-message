@@ -1,0 +1,8 @@
+{
+  "discord_webhook_url": "https://discord.com/api/webhooks/XXXXXXXXXXXX/YYYYYYYYYYYYYYYYYYYYYYYY",
+  "username": "Restart Notifier",
+  "avatar_url": "",
+  "mention": "",
+  "notify_on": ["update", "manual", "shutdown", "unexpected", "crash", "unknown"],
+  "include_downtime": true
+}
