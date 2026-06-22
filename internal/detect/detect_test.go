@@ -183,6 +183,33 @@ func TestLatest_CleanShutdownColdBoot(t *testing.T) {
 
 // A 1074 from a previous boot cycle (older than the previous boot marker) must
 // not be paired with the current boot.
+func TestPendingShutdown_Update(t *testing.T) {
+	records := []winevent.Record{
+		rec1074(-10*time.Second, map[string]string{
+			"param1": `C:\windows\servicing\TrustedInstaller.exe (PC)`,
+			"param4": "0x80020003",
+			"param5": "再起動",
+			"param7": `NT AUTHORITY\SYSTEM`,
+		}),
+	}
+	res, ok := PendingShutdown(records, base, 5*time.Minute)
+	if !ok {
+		t.Fatal("expected a pending shutdown")
+	}
+	if res.Category != CatUpdate {
+		t.Fatalf("category = %q, want update", res.Category)
+	}
+}
+
+func TestPendingShutdown_StaleIgnored(t *testing.T) {
+	records := []winevent.Record{
+		rec1074(-1*time.Hour, map[string]string{"param4": "0x0", "param5": "再起動"}),
+	}
+	if _, ok := PendingShutdown(records, base, 5*time.Minute); ok {
+		t.Fatal("a 1074 older than the recent window must be ignored")
+	}
+}
+
 func TestLatest_Stray1074FromPrevCycleExcluded(t *testing.T) {
 	records := []winevent.Record{
 		bootRec(203), // current boot at base

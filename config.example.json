@@ -4,5 +4,6 @@
   "avatar_url": "",
   "mention": "",
   "notify_on": ["update", "manual", "shutdown", "unexpected", "crash", "unknown"],
-  "include_downtime": true
+  "include_downtime": true,
+  "notify_shutdown_start": true
 }

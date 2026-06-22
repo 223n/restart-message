@@ -44,6 +44,14 @@ func main() {
 		err = cmdInstall(args)
 	case "uninstall":
 		err = cmdUninstall(args)
+	case "service":
+		err = cmdService(args)
+	case "install-service":
+		err = cmdInstallService(args)
+	case "uninstall-service":
+		err = cmdUninstallService(args)
+	case "shutdown-notice":
+		err = cmdShutdownNotice(args)
 	case "version", "-v", "--version":
 		fmt.Printf("restart-message %s\n", Version)
 	case "help", "-h", "--help":
@@ -66,13 +74,17 @@ func usage() {
   restart-message <command> [options]
 
 コマンド:
-  run        再起動を検知し、未通知なら Discord に通知する（タスクスケジューラ用）
-  test       設定された Webhook にテスト通知を送る
-  status     検知結果を表示するだけ（送信しない）
-  install    起動時に run を実行するタスクを登録する（要管理者権限）
-  uninstall  登録したタスクを削除する（要管理者権限）
-  version    バージョンを表示
-  help       このヘルプを表示
+  run               再起動を検知し、未通知なら Discord に通知する（タスク用）
+  test              設定された Webhook にテスト通知を送る
+  status            検知結果を表示するだけ（送信しない）
+  install           起動時に run を実行するタスクを登録する（要管理者権限）
+  uninstall         登録したタスクを削除する（要管理者権限）
+  service           Windows サービスとして実行する（SCM から起動。直接実行不可）
+  install-service   シャットダウン前通知のサービスを登録する（要管理者権限）
+  uninstall-service 上記サービスを削除する（要管理者権限）
+  shutdown-notice   シャットダウン前通知を手動で1回送る（動作確認用）
+  version           バージョンを表示
+  help              このヘルプを表示
 
 共通オプション:
   -config <path>   設定ファイルのパス
@@ -225,6 +237,20 @@ func cmdTest(args []string) error {
 	return nil
 }
 
+// cmdShutdownNotice manually fires the pre-shutdown notification once, for
+// verifying the service path without an actual shutdown.
+func cmdShutdownNotice(args []string) error {
+	fs := flag.NewFlagSet("shutdown-notice", flag.ExitOnError)
+	cfgPath := fs.String("config", "", "設定ファイルのパス")
+	fs.Parse(args)
+
+	if err := sendShutdownNotice(*cfgPath, true); err != nil {
+		return fmt.Errorf("シャットダウン通知の送信に失敗: %w", err)
+	}
+	fmt.Println("シャットダウン前通知を送信しました。")
+	return nil
+}
+
 func printResult(res *detect.Result, cfgPath string) {
 	label, _, emoji := present(res.Category)
 	fmt.Printf("検出結果:\n")
@@ -301,6 +327,60 @@ func buildMessage(cfg *config.Config, res *detect.Result) *notify.Message {
 			Fields:    fields,
 			Footer:    &notify.EmbedFooter{Text: "restart-message " + Version},
 			Timestamp: res.BootTime.UTC().Format(time.RFC3339),
+		}},
+	}
+	if cfg.Mention != "" {
+		msg.Content = cfg.Mention
+	}
+	return msg
+}
+
+// buildPendingMessage renders the pre-shutdown notice. res may be nil when the
+// in-progress shutdown could not be classified (then a generic notice is sent).
+func buildPendingMessage(cfg *config.Config, res *detect.Result) *notify.Message {
+	host, _ := os.Hostname()
+	computer := host
+	color := 0xF1C40F // amber
+	fields := []notify.EmbedField{}
+
+	if res != nil {
+		if res.Computer != "" {
+			computer = res.Computer
+		}
+		label, c, emoji := present(res.Category)
+		color = c
+		fields = append(fields,
+			notify.EmbedField{Name: "マシン", Value: nz(computer), Inline: true},
+			notify.EmbedField{Name: "種別", Value: emoji + " " + label, Inline: true},
+		)
+		if res.ReasonText != "" {
+			fields = append(fields, notify.EmbedField{Name: "理由", Value: res.ReasonText})
+		}
+		if res.Process != "" {
+			fields = append(fields, notify.EmbedField{Name: "開始プロセス", Value: res.Process})
+		}
+		if res.User != "" {
+			fields = append(fields, notify.EmbedField{Name: "実行ユーザー", Value: res.User, Inline: true})
+		}
+		if res.ShutdownType != "" {
+			fields = append(fields, notify.EmbedField{Name: "種類", Value: res.ShutdownType, Inline: true})
+		}
+	} else {
+		fields = append(fields,
+			notify.EmbedField{Name: "マシン", Value: nz(computer), Inline: true},
+			notify.EmbedField{Name: "状態", Value: "シャットダウン処理を開始しました"},
+		)
+	}
+
+	msg := &notify.Message{
+		Username:  cfg.Username,
+		AvatarURL: cfg.AvatarURL,
+		Embeds: []notify.Embed{{
+			Title:     "⏻ まもなくシャットダウン/再起動します",
+			Color:     color,
+			Fields:    fields,
+			Footer:    &notify.EmbedFooter{Text: "restart-message " + Version},
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
 		}},
 	}
 	if cfg.Mention != "" {
