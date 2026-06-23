@@ -183,6 +183,22 @@ func TestLatest_CleanShutdownColdBoot(t *testing.T) {
 
 // A 1074 from a previous boot cycle (older than the previous boot marker) must
 // not be paired with the current boot.
+func TestParseHex(t *testing.T) {
+	cases := map[string]uint32{
+		"0x80020003":  0x80020003,
+		"80020003":    0x80020003,
+		"0x0":         0,
+		"":            0,
+		"0xZZZ":       0, // invalid -> 0
+		"0x1FFFFFFFF": 0, // exceeds uint32 -> rejected -> 0 (no silent truncation)
+	}
+	for in, want := range cases {
+		if got := parseHex(in); got != want {
+			t.Errorf("parseHex(%q) = 0x%X, want 0x%X", in, got, want)
+		}
+	}
+}
+
 func TestPendingShutdown_Update(t *testing.T) {
 	records := []winevent.Record{
 		rec1074(-10*time.Second, map[string]string{

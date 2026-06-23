@@ -22,7 +22,7 @@ import (
 )
 
 // Version is the build version (overridable via -ldflags "-X main.Version=...").
-var Version = "0.2.0"
+var Version = "0.2.1"
 
 func main() {
 	if len(os.Args) < 2 {
