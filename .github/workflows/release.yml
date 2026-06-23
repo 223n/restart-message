@@ -1,0 +1,73 @@
+name: Release
+
+# リリース公開時に、Windows バイナリと SHA256SUMS をビルドしてリリースへ添付します。
+# あわせてビルド来歴(provenance)を署名・保存します（GitHub Attestations に保存され、
+# リリース資産ではありません。検証は `gh attestation verify <file> --repo <owner>/<repo>`）。
+# workflow_dispatch では既存のリリースタグを指定して再添付できます。
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "対象のリリースタグ (例: 0.2.2)"
+        required: true
+
+permissions:
+  contents: write # リリースへのアセット追加
+  id-token: write # provenance 署名
+  attestations: write # provenance 保存
+
+jobs:
+  build-and-attach:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    # タグは式で env に取り込み、run スクリプト内では必ずシェル変数 ($TAG) として参照する
+    # （${{ }} を run へ直接展開しないことでスクリプトインジェクションを防ぐ）。
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout (tagged commit)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        shell: bash
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          mkdir -p dist
+          out="dist/restart-message_${TAG}_windows_amd64.exe"
+          go build -trimpath -ldflags "-s -w -X main.Version=${TAG}" -o "$out" .
+          echo "ASSET=$out" >> "$GITHUB_ENV"
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum "restart-message_${TAG}_windows_amd64.exe" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.ASSET }}
+
+      - name: Upload assets to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # workflow_dispatch でリリース未作成のタグを指定された場合に備えて、無ければ作成する。
+          gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "$REPO" --title "$TAG" --notes ""
+          gh release upload "$TAG" "$ASSET" dist/SHA256SUMS.txt --clobber --repo "$REPO"
