@@ -281,7 +281,10 @@ func parseHex(s string) uint32 {
 	if s == "" {
 		return 0
 	}
-	v, err := strconv.ParseUint(s, 16, 64)
+	// Parse directly as 32-bit: reason codes are 32-bit, and this makes the
+	// value provably fit in uint32 (ParseUint rejects anything larger), so the
+	// conversion can't silently truncate (CodeQL go/incorrect-integer-conversion).
+	v, err := strconv.ParseUint(s, 16, 32)
 	if err != nil {
 		return 0
 	}
