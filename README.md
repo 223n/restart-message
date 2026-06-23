@@ -42,6 +42,22 @@ Discord の Webhook で通知を送る軽量ツールです。次の 2 つの通
 - Windows 10 / 11
 - ビルド時のみ: Go 1.25 以降
 
+## ダウンロードと検証
+
+ビルド済みバイナリは [Releases](https://github.com/223n/restart-message/releases) から入手できます。各リリースには実行ファイルと `SHA256SUMS.txt` が添付されます。
+
+ダウンロード後、SHA256 が一致することを確認してください。
+
+```powershell
+Get-FileHash .\restart-message_0.2.1_windows_amd64.exe -Algorithm SHA256
+```
+
+ビルド来歴（provenance）も検証できます（GitHub CLI が必要）。
+
+```powershell
+gh attestation verify .\restart-message_0.2.1_windows_amd64.exe --repo 223n/restart-message
+```
+
 ## ビルド
 
 ```powershell
@@ -211,6 +227,22 @@ go test ./...
 go vet ./...
 ```
 
+### リリース
+
+タグ付きのリリースを公開すると、GitHub Actions（`release.yml`）が自動で実行ファイルと
+`SHA256SUMS.txt` をビルドして添付し、ビルド来歴（provenance）の署名を付与します。
+
+```powershell
+# 例: develop で git-flow の release/hotfix を終えてタグを push したのち
+gh release create 0.2.2 --title "restart-message 0.2.2" --notes "..."
+```
+
+CI:
+
+- `codeql.yml` … CodeQL によるコード解析（push / PR / 週次）
+- `dependabot.yml` … 依存更新（PR は `develop` 宛）
+- `release.yml` … リリース公開時のバイナリ・チェックサム・provenance 添付
+
 ## ディレクトリ構成
 
 ```text
@@ -225,9 +257,15 @@ restart-message/
 │  ├─ config/                  設定読み込み
 │  └─ state/                   通知済み状態の永続化
 ├─ scripts/                    build / install / uninstall (PowerShell)
+├─ .github/                    CodeQL / Dependabot / Release ワークフロー, SECURITY.md
 ├─ config.example.json
 └─ README.md
 ```
+
+## セキュリティ
+
+脆弱性の報告方法と運用上の注意（SYSTEM 権限での動作、Webhook 秘密情報の扱い、
+実行ファイル配置による権限昇格など）は [SECURITY.md](.github/SECURITY.md) を参照してください。
 
 ## ライセンス
 
