@@ -102,7 +102,7 @@ Goツールチェーンや依存ライブラリ（`golang.org/x/sys`）に脆弱
 GitHub Releasesに記載したSHA256と、ダウンロードしたファイルのハッシュが一致することを確認してください。
 
 ```powershell
-Get-FileHash .\restart-message_0.2.1_windows_amd64.exe -Algorithm SHA256
+Get-FileHash .\restart-message_0.3.0_windows_amd64.exe -Algorithm SHA256
 ```
 
 一致しない場合は使用せず、報告してください。
