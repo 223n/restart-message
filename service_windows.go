@@ -128,7 +128,11 @@ func sendShutdownNotice(cfgPath string, force bool) error {
 	return err
 }
 
-// cmdInstallService registers the service (auto-start, LocalSystem) and starts it.
+// cmdInstallService registers the service (auto-start, LocalSystem) and starts
+// it. Any pre-existing restart-message service registrations (e.g. left by an
+// older version that was installed under a different name or path) are stopped
+// and removed first, so re-running this command cleanly replaces them instead of
+// accumulating duplicates.
 func cmdInstallService(args []string) error {
 	fs := flag.NewFlagSet("install-service", flag.ExitOnError)
 	cfgPath := fs.String("config", "", "サービスが使用する設定ファイルのパス")
@@ -146,9 +150,10 @@ func cmdInstallService(args []string) error {
 	}
 	defer m.Disconnect()
 
-	if existing, oerr := m.OpenService(serviceName); oerr == nil {
-		existing.Close()
-		return fmt.Errorf("サービス %q は既に存在します。先に uninstall-service を実行してください", serviceName)
+	// Idempotent install: stop and delete every existing restart-message service
+	// before (re)creating the canonical one.
+	for _, name := range removeOwnServices(m, exe) {
+		fmt.Printf("既存サービス %q を削除しました。\n", name)
 	}
 
 	svcArgs := []string{"service"}
@@ -157,14 +162,27 @@ func cmdInstallService(args []string) error {
 		svcArgs = append(svcArgs, "-config", abs)
 	}
 
-	s, err := m.CreateService(serviceName, exe, mgr.Config{
+	svcCfg := mgr.Config{
 		DisplayName:  "Restart Message (shutdown notifier)",
 		Description:  "シャットダウン/再起動の開始時に Discord へ通知します (restart-message)",
 		StartType:    mgr.StartAutomatic,
 		ServiceType:  windowsOwnProcess,
 		ErrorControl: mgr.ErrorNormal,
-	}, svcArgs...)
-	if err != nil {
+	}
+	// A just-deleted service can linger "marked for deletion" for a moment until
+	// the SCM and the old process fully release it; recreating under the same
+	// name then fails with ERROR_SERVICE_MARKED_FOR_DELETE. Retry briefly
+	// (~10s max) to ride that out; other errors stay fatal.
+	var s *mgr.Service
+	for attempt := 0; ; attempt++ {
+		s, err = m.CreateService(serviceName, exe, svcCfg, svcArgs...)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) && attempt < 20 {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
 		return fmt.Errorf("サービスの作成に失敗: %w", err)
 	}
 	defer s.Close()
@@ -185,7 +203,8 @@ func cmdInstallService(args []string) error {
 	return nil
 }
 
-// cmdUninstallService stops and removes the service.
+// cmdUninstallService stops and removes every restart-message service (the
+// canonical one plus any stragglers left by older versions).
 func cmdUninstallService(args []string) error {
 	m, err := mgr.Connect()
 	if err != nil {
@@ -193,32 +212,148 @@ func cmdUninstallService(args []string) error {
 	}
 	defer m.Disconnect()
 
-	s, err := m.OpenService(serviceName)
+	exe, _ := os.Executable()
+	exe, _ = filepath.Abs(exe)
+
+	names, err := findOwnServices(m, exe)
 	if err != nil {
-		return fmt.Errorf("サービス %q が見つかりません: %w", serviceName, err)
+		return fmt.Errorf("サービスの列挙に失敗: %w", err)
+	}
+	if len(names) == 0 {
+		return fmt.Errorf("restart-message のサービスが見つかりません")
+	}
+
+	var failed int
+	for _, name := range names {
+		if derr := removeService(m, name); derr != nil {
+			failed++
+			fmt.Printf("サービス %q の削除に失敗: %v\n", name, derr)
+			continue
+		}
+		fmt.Printf("サービス %q を削除しました。\n", name)
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d 件のサービスを削除できませんでした", failed)
+	}
+	return nil
+}
+
+// removeOwnServices stops and deletes every installed restart-message service
+// and returns the names it actually removed. It is best-effort: failures to
+// enumerate or to remove an individual service are reported but do not abort the
+// caller, so a single stuck registration cannot block the rest of an install.
+func removeOwnServices(m *mgr.Mgr, exe string) []string {
+	names, err := findOwnServices(m, exe)
+	if err != nil {
+		fmt.Printf("既存サービスの列挙に失敗（続行します）: %v\n", err)
+		return nil
+	}
+	var removed []string
+	for _, name := range names {
+		if derr := removeService(m, name); derr != nil {
+			svcLog("", fmt.Sprintf("remove existing service %q failed: %v", name, derr))
+			fmt.Printf("既存サービス %q の削除に失敗（続行します）: %v\n", name, derr)
+			continue
+		}
+		removed = append(removed, name)
+	}
+	return removed
+}
+
+// findOwnServices enumerates installed Win32 services and returns those that
+// belong to restart-message. A service matches if its name is the canonical name
+// or carries the "restart-message-" namespace prefix, or — as a fallback for
+// differently named registrations — if its image is this exe (matched by base
+// name) invoked with the "service" subcommand. The trailing hyphen on the prefix
+// keeps unrelated names like "restart-messages-foo" out. Services that cannot be
+// opened or queried are skipped, so a denied protected service never aborts the scan.
+func findOwnServices(m *mgr.Mgr, exe string) ([]string, error) {
+	names, err := m.ListServices()
+	if err != nil {
+		return nil, err
+	}
+	const namePrefix = "restart-message-"
+	exeBase := strings.ToLower(filepath.Base(exe))
+	canonical := strings.ToLower(serviceName)
+
+	var ours []string
+	for _, name := range names {
+		lname := strings.ToLower(name)
+		if lname == canonical || strings.HasPrefix(lname, namePrefix) || serviceUsesBinary(m, name, exeBase) {
+			ours = append(ours, name)
+		}
+	}
+	return ours, nil
+}
+
+// serviceUsesBinary reports whether the named service's image is our exe
+// (compared by base name) invoked with the "service" subcommand. Any error
+// opening or querying the service is treated as "not ours" so the scan stays
+// resilient to protected services that deny access.
+func serviceUsesBinary(m *mgr.Mgr, name, exeBase string) bool {
+	if exeBase == "" {
+		return false
+	}
+	s, err := m.OpenService(name)
+	if err != nil {
+		return false
+	}
+	defer s.Close()
+	cfg, err := s.Config()
+	if err != nil {
+		return false
+	}
+	bin := strings.ToLower(cfg.BinaryPathName)
+	return strings.Contains(bin, exeBase) && strings.Contains(bin, " service")
+}
+
+// removeService stops the named service (waiting for Stopped so Delete doesn't
+// race a running process, which would leave it "marked for deletion") and then
+// deletes it. A service that is already gone, or already marked for deletion, is
+// treated as success so cleanup stays idempotent.
+func removeService(m *mgr.Mgr, name string) error {
+	s, err := m.OpenService(name)
+	if err != nil {
+		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+			return nil // raced away between enumeration and now
+		}
+		return fmt.Errorf("オープンに失敗: %w", err)
 	}
 	defer s.Close()
 
-	// Stop first and wait briefly for Stopped, so Delete doesn't race a running
-	// process (which would leave the service "marked for deletion").
-	if st, cerr := s.Control(svc.Stop); cerr != nil {
-		// ERROR_SERVICE_NOT_ACTIVE and "cannot accept control" are benign here.
-		svcLog("", "stop during uninstall: "+cerr.Error())
-	} else {
+	// Control reports a non-nil error even for the benign cases. Only
+	// ERROR_SERVICE_NOT_ACTIVE means "already stopped" and lets us skip the wait;
+	// "cannot accept control"/"invalid control" mean the service is still
+	// running or transitioning, so we must fall through and wait for Stopped
+	// (otherwise Delete merely marks it for deletion). Any other error (e.g.
+	// access denied) is logged; Delete below will surface it for real.
+	st, cerr := s.Control(svc.Stop)
+	alreadyStopped := errors.Is(cerr, windows.ERROR_SERVICE_NOT_ACTIVE)
+	if cerr != nil && !alreadyStopped {
+		svcLog("", fmt.Sprintf("stop %q during removal: %v", name, cerr))
+	}
+	if !alreadyStopped {
 		deadline := time.Now().Add(10 * time.Second)
 		for st.State != svc.Stopped && time.Now().Before(deadline) {
 			time.Sleep(300 * time.Millisecond)
 			q, qerr := s.Query()
 			if qerr != nil {
+				svcLog("", fmt.Sprintf("query %q during removal: %v; deleting anyway", name, qerr))
 				break
 			}
 			st = q
 		}
+		if st.State != svc.Stopped {
+			svcLog("", fmt.Sprintf("service %q not Stopped before delete (state=%d); may end up marked-for-deletion", name, st.State))
+		}
 	}
+
 	if err := s.Delete(); err != nil {
-		return fmt.Errorf("サービスの削除に失敗: %w", err)
+		if errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
+			return nil // a prior run/handle already started removal
+		}
+		return fmt.Errorf("削除に失敗: %w", err)
 	}
-	fmt.Printf("サービス %q を削除しました。\n", serviceName)
 	return nil
 }
 
