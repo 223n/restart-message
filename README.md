@@ -184,6 +184,7 @@ Windowsサービスとして常駐し、SCMの **PRESHUTDOWN** 通知
 ```
 
 - サービス名: `restart-message-svc`（自動起動・LocalSystem）
+- 再実行すると、既存の `restart-message` サービス（旧バージョンの残骸を含む）を停止・削除してから登録し直します（重複登録の防止）
 - 通知後はすぐ終了し、シャットダウンを長く止めません（短いタイムアウト＋少数回リトライ）
 - 直前の `Event 1074` から種別（Windows Update / 手動など）も付記（取得できた場合）
 
@@ -198,6 +199,8 @@ Windowsサービスとして常駐し、SCMの **PRESHUTDOWN** 通知
 ```powershell
 .\bin\restart-message.exe uninstall-service
 ```
+
+`restart-message` のサービスをすべて（旧バージョンの残骸を含めて）停止・削除します。
 
 > **注意（割り込みの限界）:** 電源喪失・バッテリ切れ・ブルースクリーン・
 > `shutdown /f` などの強制終了では、シャットダウン前に割り込めません。
