@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 // Record is a single parsed event-log entry.
@@ -34,7 +36,11 @@ const (
 )
 
 var (
-	modwevtapi    = syscall.NewLazyDLL("wevtapi.dll")
+	// NewLazySystemDLL resolves the name against %SystemRoot%\System32 only.
+	// syscall.NewLazyDLL would follow the default search order, which looks in
+	// the directory of the executable first — and this binary runs as SYSTEM, so
+	// a wevtapi.dll dropped next to it would be loaded with those privileges.
+	modwevtapi    = windows.NewLazySystemDLL("wevtapi.dll")
 	procEvtQuery  = modwevtapi.NewProc("EvtQuery")
 	procEvtNext   = modwevtapi.NewProc("EvtNext")
 	procEvtRender = modwevtapi.NewProc("EvtRender")
