@@ -60,6 +60,15 @@ jobs:
       - name: go build
         run: go build ./...
 
+      # リリースでは windows/arm64 も配布するが、ランナー(x64)では実行できないため
+      # テストは回せない。せめてコンパイルが通ることは PR の時点で確かめておく
+      # （リリース時に初めて壊れているのを見つけないため）。クロスコンパイルなので安い。
+      - name: go build (windows/arm64)
+        env:
+          GOOS: windows
+          GOARCH: arm64
+        run: go build ./...
+
       - name: go test
         run: go test ./...
 
