@@ -39,6 +39,15 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # 署名付きの成果物を配る前に、タグが指すコミットで静的検査とテストを通す。
+      # CI ワークフローは push / pull_request で走るが、リリースはタグを ref に
+      # チェックアウトするため、ここで改めて確認する。
+      - name: Vet and test
+        shell: bash
+        run: |
+          go vet ./...
+          go test ./...
+
       - name: Build
         shell: bash
         env:
@@ -49,6 +58,16 @@ jobs:
           out="dist/restart-message_${TAG}_windows_amd64.exe"
           go build -trimpath -ldflags "-s -w -X main.Version=${TAG}" -o "$out" .
           echo "ASSET=$out" >> "$GITHUB_ENV"
+
+      # -ldflags の -X は記号名を間違えても無警告で通る（`-X main.Verison=...` は
+      # exit 0）。Version は version サブコマンドだけでなく Discord embed の
+      # フッターにも出るため、生成した exe を実際に起動して埋め込みを確認する。
+      # version は設定もネットワークも権限も要求しない。
+      - name: Smoke test the built binary
+        shell: bash
+        run: |
+          "$ASSET" version
+          "$ASSET" version | grep -qF "restart-message $TAG"
 
       - name: Generate checksums
         shell: bash
