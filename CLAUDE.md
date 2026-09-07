@@ -16,14 +16,17 @@ export PATH="/c/Program Files/Go/bin:$PATH"
 ```
 
 ```bash
-go test ./...                          # 全テスト（テストは detect / notify パッケージのみ）
+go test ./...                          # 全テスト（テストは detect / notify パッケージのみ。非Windowsではルートpkgが黙って除外される）
 go test -run TestLatest ./internal/detect   # 単一テスト
 go vet ./...                           # 静的検査
 go build -trimpath -ldflags "-s -w" -o bin/restart-message.exe .   # 手動ビルド
 pwsh -File scripts/build.ps1           # 推奨ビルド（bin\restart-message.exe を生成）
 ```
 
-非Windows環境では、ビルドタグ付きパッケージ（main / `winevent` / `task_windows` / `service_windows`）はコンパイルされない。`detect` / `notify` / `config` / `state` はタグなしでクロスプラットフォームにテスト可能。
+非Windows環境では、`//go:build windows` の付いたファイル（ルートの main / `task_windows` / `service_windows`、および `winevent/winevent.go`）はコンパイルされない。
+`detect` / `notify` / `config` / `state` と `winevent/record.go`（`Record` 型と XML デコード）はタグなしなので、どのOSでもテストできる。
+
+**注意**: 非Windowsで `go test ./...` を実行すると exit 0 で成功したように見えるが、ルートパッケージは全ファイルがタグ付きのため出力にすら現れず、黙って検査対象から外れる。同じ理由で `GOOS=windows` を付けない `govulncheck` も Windows 専用コードを見逃す。全体を検査するなら `GOOS=windows go vet ./...` を併用すること。
 
 ## アーキテクチャ
 
@@ -42,7 +45,7 @@ pwsh -File scripts/build.ps1           # 推奨ビルド（bin\restart-message.e
 ### パッケージの責務
 
 - [main.go](main.go) — サブコマンドのディスパッチと**表示整形のみ**（Discord embedの構築 `buildMessage` / `buildPendingMessage`、カテゴリ→ラベル/色/絵文字の対応 `present`、`collect` によるブート検知のリトライ）。
-- [internal/winevent/](internal/winevent/) — `wevtapi.dll` をネイティブ呼び出しでイベントログを読む。**`wevtutil`/PowerShell をシェルアウトしない**設計（依存削減＋コンソールのコードページ破損回避。UTF-16を明示デコード）。
+- [internal/winevent/](internal/winevent/) — `wevtapi.dll` をネイティブ呼び出しでイベントログを読む。`record.go`（`Record` 型・XMLデコード）はビルドタグなし、`winevent.go`（API呼び出し）は `//go:build windows`。この分割により `detect` はどのOSでもテストできる。DLLは `windows.NewLazySystemDLL` で System32 からのみ読み込む（SYSTEM権限で動くためDLLプリロード対策）。**`wevtutil`/PowerShell をシェルアウトしない**設計（依存削減＋コンソールのコードページ破損回避。UTF-16を明示デコード）。
 - [internal/detect/](internal/detect/) — **本体の心臓部**。イベントログ群から最新ブートを分類する（`Latest`）／進行中シャットダウンを分類する（`PendingShutdown`）。
 - [internal/notify/](internal/notify/) — Discord Webhook送信。`HTTPError.Permanent()` で永続エラー（429以外の4xx）はリトライ打ち切り。**Webhook URL の秘密トークンをエラーに漏らさない**（`scrubURLError` が `*url.Error` を全層剥がす）。
 - [internal/config/](internal/config/) — 設定の読込。既定値 → 設定ファイル → 環境変数 `DISCORD_WEBHOOK_URL` の順で上書き。

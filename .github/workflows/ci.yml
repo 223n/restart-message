@@ -1,0 +1,82 @@
+name: CI
+
+# ビルド・静的検査・テストと、Go 標準ライブラリの脆弱性検査を回します。
+#
+# ランナーを windows-latest にしているのは、このリポジトリのコードの大半が
+# `//go:build windows` を持つためです。非Windowsで `go test ./...` を回すと
+# exit 0 で成功したように見えますが、ルートパッケージ(main / task_windows /
+# service_windows)は全ファイルがタグ付きのため出力にすら現れず、黙って検査対象
+# から外れます。govulncheck も同様に Windows 専用コードを見逃します。
+
+on:
+  push:
+    branches: ["develop", "main"]
+  pull_request:
+    # git-flow では release/* と hotfix/* が main 宛になるため main も対象にする。
+    branches: ["develop", "main"]
+  schedule:
+    # 毎週月曜 02:40 UTC。CodeQL(02:30)とずらす。
+    # コード変更がなくても脆弱性データベース側の更新だけで落ちるようにするための定期実行。
+    # go.mod は `go 1.26.8` とパッチまで固定されており Dependabot は更新しないので、
+    # これが「Goを上げる時期」を知る唯一の自動シグナルになる。
+    - cron: "40 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        shell: bash
+        run: |
+          # gofmt -l は未整形ファイルがあっても exit 0 を返すため、出力の有無で判定する。
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt が必要なファイルがあります"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test ./...
+
+  govulncheck:
+    name: govulncheck
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # バージョンを固定しないのは、脆弱性データベースが常時更新される以上
+      # ツール側を古いまま留める意味が薄いため。
+      - name: Run govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
