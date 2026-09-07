@@ -123,3 +123,53 @@ func TestSendWithRetry_EventuallySucceeds(t *testing.T) {
 		t.Fatalf("calls = %d, want 2", calls)
 	}
 }
+
+// A webhook URL shaped like Discord's: a 19-digit id and a 68-character token.
+const (
+	testWebhookID    = "1234567890123456789"
+	testWebhookToken = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+)
+
+func TestSend_ResponseBodyEchoingTheURLDoesNotLeakTheToken(t *testing.T) {
+	// A TLS-terminating proxy answering instead of Discord typically puts the
+	// whole request URL into its error page. That body ends up in service.log.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		io.WriteString(w, "upstream failed for "+r.URL.Path)
+	}))
+	defer srv.Close()
+
+	url := srv.URL + "/api/webhooks/" + testWebhookID + "/" + testWebhookToken
+	err := Send(url, &Message{Content: "x"}, 5*time.Second)
+	if err == nil {
+		t.Fatal("expected an error on 502")
+	}
+	if strings.Contains(err.Error(), testWebhookToken) {
+		t.Fatalf("error leaked the webhook token: %v", err)
+	}
+	if strings.Contains(err.Error(), testWebhookID) {
+		t.Fatalf("error leaked the webhook id: %v", err)
+	}
+	if !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Fatalf("expected the echoed segments to be redacted: %v", err)
+	}
+}
+
+func TestSend_DiscordErrorBodyIsKeptIntact(t *testing.T) {
+	// Redaction must not cost us the diagnostic Discord actually returns.
+	const body = `{"message":"Unknown Webhook","code":10015}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, body)
+	}))
+	defer srv.Close()
+
+	url := srv.URL + "/api/webhooks/" + testWebhookID + "/" + testWebhookToken
+	err := Send(url, &Message{Content: "x"}, 5*time.Second)
+	if err == nil {
+		t.Fatal("expected an error on 404")
+	}
+	if !strings.Contains(err.Error(), body) {
+		t.Fatalf("Discord's error body was altered: %v", err)
+	}
+}
