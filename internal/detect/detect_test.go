@@ -69,7 +69,7 @@ func TestLatest_Manual(t *testing.T) {
 			"param3": "その他 (計画外)",
 			"param4": "0x0",
 			"param5": "再起動",
-			"param7": `PC\Keita`,
+			"param7": `PC\User`,
 		}),
 	}
 	res, _ := Latest(records)
@@ -111,7 +111,7 @@ func TestLatest_Event41NoBugcheckIsNotUnexpected(t *testing.T) {
 			"param1": `C:\...\StartMenuExperienceHost.exe (PC)`,
 			"param4": "0x0",
 			"param5": "再起動",
-			"param7": `PC\Keita`,
+			"param7": `PC\User`,
 		}),
 	}
 	res, _ := Latest(records)
@@ -162,6 +162,31 @@ func TestLatest_SystemPlannedPowerOffIsShutdown(t *testing.T) {
 	res, _ := Latest(records)
 	if res.Category != CatShutdown {
 		t.Fatalf("category = %q, want shutdown", res.Category)
+	}
+}
+
+// Taken verbatim from a real Event 1074 on Japanese Windows 11 (only the
+// computer and user names are anonymised). Japanese renders a power-off as
+// 電源を切る, not シャットダウン, so this record classified as "manual" until
+// isPowerOff learned the string. param4 is "0x0" here, which also confirms
+// that Windows renders the reason code as 0x-prefixed hex.
+func TestLatest_JapanesePowerOffIsShutdown(t *testing.T) {
+	records := []winevent.Record{
+		bootRec(203),
+		rec1074(-1*time.Minute, map[string]string{
+			"param1": `C:\Windows\SystemApps\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\StartMenuExperienceHost.exe (PC)`,
+			"param3": "その他 (計画外)",
+			"param4": "0x0",
+			"param5": "電源を切る",
+			"param7": `PC\User`,
+		}),
+	}
+	res, _ := Latest(records)
+	if res.Category != CatShutdown {
+		t.Fatalf("category = %q, want shutdown", res.Category)
+	}
+	if res.ReasonCode != 0 {
+		t.Fatalf("ReasonCode = 0x%X, want 0x0", res.ReasonCode)
 	}
 }
 
@@ -234,7 +259,7 @@ func TestLatest_Stray1074FromPrevCycleExcluded(t *testing.T) {
 			"param1": `C:\...\StartMenuExperienceHost.exe (PC)`,
 			"param4": "0x0",
 			"param5": "再起動",
-			"param7": `PC\Keita`,
+			"param7": `PC\User`,
 		}),
 	}
 	res, _ := Latest(records)

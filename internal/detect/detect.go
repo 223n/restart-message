@@ -253,11 +253,28 @@ func isUpdate(e *winevent.Record) bool {
 	return false
 }
 
+// isPowerOff reports whether Event 1074's param5 describes a full power-off
+// rather than a restart.
+//
+// param5 is the localised shutdown-type string, and Event 1074 carries no
+// numeric equivalent, so matching text is the only option here. The list below
+// is therefore the known-good set rather than a complete one: a locale whose
+// string is missing falls through to the restart path and is reported as
+// "manual". Confirmed renderings:
+//
+//	en  "power off", "shutdown"
+//	ja  "電源を切る"  (observed on Japanese Windows 11)
+//	ja  "シャットダウン"
+//
+// Add a locale here only from an actual Event 1074, not from a translation of
+// the word "shutdown" — Japanese renders the power-off case as 電源を切る, not
+// as シャットダウン, and assuming otherwise is what let this case slip through.
 func isPowerOff(e *winevent.Record) bool {
 	st := strings.ToLower(e.Data["param5"])
 	return strings.Contains(st, "power off") ||
 		strings.Contains(st, "shutdown") ||
-		strings.Contains(st, "シャットダウン")
+		strings.Contains(st, "シャットダウン") ||
+		strings.Contains(st, "電源を切る")
 }
 
 func findFirst(records []winevent.Record, pred func(*winevent.Record) bool) *winevent.Record {
