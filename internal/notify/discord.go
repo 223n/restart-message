@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -189,8 +190,20 @@ func parseRetryAfter(resp *http.Response, body []byte) time.Duration {
 // clampRetryAfter bounds a server-provided delay (in seconds) to [0, maxRetryAfter],
 // so a hostile or buggy response can't overflow the conversion or make the
 // boot-time notifier sleep for an absurd duration.
+//
+// NaN must be rejected explicitly, before the bounds: it compares false against
+// both of them, so it would otherwise reach time.Duration(NaN * 1e9) — a
+// float-to-integer conversion the Go spec leaves undefined, which on amd64
+// yields the most negative int64. It is reachable from the wire rather than
+// merely theoretical, because strconv.ParseFloat("NaN", 64) succeeds with a nil
+// error: a hostile responder or a broken TLS-terminating proxy need only send
+// "Retry-After: NaN". Only the header can carry it — the JSON body path is safe
+// because encoding/json rejects NaN, which is not valid JSON.
+//
+// The infinities need no case of their own: -Inf is caught by the lower bound
+// and +Inf by the upper one, so both already clamp to 0 and maxRetryAfter.
 func clampRetryAfter(secs float64) time.Duration {
-	if secs <= 0 {
+	if math.IsNaN(secs) || secs <= 0 {
 		return 0
 	}
 	if secs > maxRetryAfter.Seconds() {
