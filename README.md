@@ -1,5 +1,11 @@
 # restart-message
 
+[![CI](https://img.shields.io/github/actions/workflow/status/223n/restart-message/ci.yml?branch=main&label=CI)](https://github.com/223n/restart-message/actions/workflows/ci.yml)
+[![CodeQL](https://img.shields.io/github/actions/workflow/status/223n/restart-message/codeql.yml?branch=main&label=CodeQL)](https://github.com/223n/restart-message/actions/workflows/codeql.yml)
+[![Release](https://img.shields.io/github/v/release/223n/restart-message?label=release)](https://github.com/223n/restart-message/releases/latest)
+[![License](https://img.shields.io/github/license/223n/restart-message?label=license)](LICENSE)
+[![Go](https://img.shields.io/github/go-mod/go-version/223n/restart-message?label=go)](go.mod)
+
 Windowsが再起動した際（Windows Update・手動・予期しないシャットダウンなど）に、
 DiscordのWebhookで通知を送る軽量ツールです。
 次の2つの通知に対応します。
@@ -40,24 +46,57 @@ DiscordのWebhookで通知を送る軽量ツールです。
 
 ## 必要要件
 
-- Windows 10 / 11（x64）
-  - 配布している実行ファイルは x64 版のみです。
+- Windows 10 / 11（x64 / ARM64）
+  - x64（Intel / AMD）の環境では `amd64` 版を、ARM64の環境（Snapdragon搭載PCなど）では
+    `arm64` 版を使用します。
+  - Windows 11 on ARM は x64 のエミュレーションに対応しているため、ARM64の環境でも
+    `amd64` 版は動作します。ただし、ネイティブで動く `arm64` 版を推奨します。
 - ビルド時のみ: Go 1.26.8以降
 
 ## ダウンロードと検証
 
-ビルド済みバイナリは [Releases](https://github.com/223n/restart-message/releases) から入手できます。各リリースには実行ファイルと `SHA256SUMS.txt` が添付されます。
+ビルド済みバイナリは [Releases](https://github.com/223n/restart-message/releases) から入手できます。
+各リリースには次の4ファイルが添付されます（`<version>` はリリースのタグ名です）。
 
-ダウンロード後、SHA256が一致することを確認してください。
+| ファイル                                      | 対象                                       |
+|-----------------------------------------------|--------------------------------------------|
+| `restart-message_<version>_windows_amd64.exe` | x64（Intel / AMD）のWindows                |
+| `restart-message_<version>_windows_arm64.exe` | ARM64（Snapdragon搭載PCなど）のWindows     |
+| `SHA256SUMS.txt`                              | 上記2つの実行ファイルのSHA256ハッシュ一覧  |
+| `THIRD_PARTY_NOTICES.txt`                     | 実行ファイルに含まれる第三者ライセンス表示 |
+
+どちらを選ぶか分からない場合は、PowerShellで確認できます。
+`AMD64` と表示されたら `amd64` 版、`ARM64` と表示されたら `arm64` 版です。
 
 ```powershell
-Get-FileHash .\restart-message_0.4.2_windows_amd64.exe -Algorithm SHA256
+$env:PROCESSOR_ARCHITECTURE
 ```
+
+ダウンロード後、SHA256が一致することを確認してください。
+ファイル名にはバージョンが入るため、以降のコマンドではワイルドカードで受けた変数を使い回します。
+同じPowerShellセッションのまま、続けて実行してください。
+
+```powershell
+# ARM64の環境では amd64 を arm64 に読み替えてください。
+$exe  = (Get-Item .\restart-message_*_windows_amd64.exe).FullName
+$hash = (Get-FileHash $exe -Algorithm SHA256).Hash
+$line = Select-String -Path .\SHA256SUMS.txt -SimpleMatch -Pattern (Split-Path $exe -Leaf)
+# 行が見つからないまま比較すると $want が空文字になり、「MISMATCH: <hash> / 」という
+# 一致しなかったのか一覧に載っていないのか分からない表示になる。先に切り分ける。
+if (-not $line) { "NOT LISTED: $(Split-Path $exe -Leaf) は SHA256SUMS.txt にありません" }
+else {
+    $want = ($line.Line -split '\s+')[0]
+    if ($hash -ieq $want) { "OK: $hash" } else { "MISMATCH: $hash / $want" }
+}
+```
+
+`OK:` に続けてハッシュが表示されれば一致です。`Get-FileHash` は大文字、`SHA256SUMS.txt` は
+小文字でハッシュを出力するため、比較は大文字小文字を区別しない `-ieq` で行っています。
 
 ビルド来歴（provenance）も検証できます（GitHub CLIが必要）。
 
 ```powershell
-gh attestation verify .\restart-message_0.4.2_windows_amd64.exe --repo 223n/restart-message
+gh attestation verify $exe --repo 223n/restart-message
 ```
 
 ## ビルド
@@ -67,9 +106,21 @@ pwsh -File scripts/build.ps1
 # 生成物: bin\restart-message.exe
 ```
 
+ARM64版をビルドする場合は `-Arch` を指定します。出力先の名前が変わるため、
+タスク登録時は `install-task.ps1` に `-ExePath` で明示してください。
+
+```powershell
+pwsh -File scripts/build.ps1 -Arch arm64
+# 生成物: bin\restart-message_arm64.exe
+```
+
+`-Version` を省略すると、`main.go` の `Version` の値がそのまま使われます。
+リリース時のバージョンは `release.yml` が埋め込むため、通常は指定不要です。
+
 手動でビルドする場合:
 
 ```powershell
+$env:GOOS = "windows"; $env:GOARCH = "amd64"   # ARM64版は arm64
 go build -trimpath -ldflags "-s -w" -o bin\restart-message.exe .
 ```
 
@@ -179,7 +230,8 @@ New-Item -ItemType Directory -Force -Path 'C:\Program Files\restart-message' | O
 Copy-Item .\bin\restart-message.exe 'C:\Program Files\restart-message\restart-message.exe'
 ```
 
-Releasesから入手した場合は、`restart-message_<version>_windows_amd64.exe` を
+Releasesから入手した場合は、`restart-message_<version>_windows_amd64.exe`
+（ARM64の環境では `restart-message_<version>_windows_arm64.exe`）を
 `restart-message.exe` にリネームして同じ場所へ置きます。
 
 一般ユーザーに書き込み権限がないことを確認します。
@@ -302,8 +354,9 @@ go vet ./...
 
 ### リリース
 
-タグ付きのリリースを公開すると、GitHub Actions（`release.yml`）が自動で実行ファイルと
-`SHA256SUMS.txt` をビルドして添付し、ビルド来歴（provenance）の署名を付与します。
+タグ付きのリリースを公開すると、GitHub Actions（`release.yml`）が自動で
+amd64 / arm64 の実行ファイルと、両方を1つにまとめた `SHA256SUMS.txt` をビルドして添付し、
+ビルド来歴（provenance）の署名を付与します。
 
 ```powershell
 # git-flow の release/hotfix を main へマージし、タグを push したのち。
@@ -320,10 +373,13 @@ gh release create $tag --title "restart-message $tag" --notes-file notes.md
 CI:
 
 - `ci.yml` … gofmt / vet / build / test と govulncheck（push / PR / 週次）
+  - `build` は windows/arm64 のクロスコンパイルも行います（リリース時に初めて
+    壊れているのを見つけないため。x64ランナー上で実行はできないためテストは回しません）
 - `codeql.yml` … CodeQLによるコード解析（push / PR / 週次）
 - `dependabot.yml` … 依存更新（PRは `develop` 宛）
-- `release.yml` … リリース公開時のバイナリ・チェックサム・provenance添付
-  - 添付の前に vet / test を通し、生成した実行ファイルを起動してバージョンを確認します
+- `release.yml` … リリース公開時のバイナリ（amd64 / arm64）・チェックサム・provenance添付
+  - 添付の前に vet / test を通し、amd64 の実行ファイルを起動してバージョンを確認します
+    （arm64 は x64 ランナー上で起動できないため、ビルド情報の検査だけを行います）
 
 ## ディレクトリ構成
 
@@ -333,15 +389,16 @@ restart-message/
 ├─ task_windows.go             install / uninstall（起動時タスク登録）
 ├─ service_windows.go          service / install-service（シャットダウン前通知）
 ├─ internal/
-│  ├─ winevent/                Windows イベントログ読取（wevtapi.dll）
+│  ├─ winevent/                Windows イベントログ読取（wevtapi.dll）（+ テスト）
 │  │                           record.go はビルドタグなし（Record 型・XMLデコード）
 │  ├─ detect/                  再起動種別の判定（+ テスト）
 │  ├─ notify/                  Discord Webhook 送信（+ テスト）
-│  ├─ config/                  設定読み込み
-│  └─ state/                   通知済み状態の永続化
+│  ├─ config/                  設定読み込み（+ テスト）
+│  └─ state/                   通知済み状態の永続化（+ テスト）
 ├─ scripts/                    build / install / uninstall (PowerShell)
 ├─ .github/                    CI / CodeQL / Dependabot / Release ワークフロー, SECURITY.md
 ├─ config.example.json
+├─ THIRD_PARTY_NOTICES.txt     第三者ソフトウェアのライセンス表示
 └─ README.md
 ```
 
@@ -353,3 +410,6 @@ restart-message/
 ## ライセンス
 
 [MIT](LICENSE)
+
+同梱している第三者ソフトウェア（`golang.org/x/sys`）の著作権表示とライセンス条文は、
+[THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) にまとめています。
