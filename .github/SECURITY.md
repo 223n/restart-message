@@ -100,13 +100,18 @@ Goツールチェーンや依存ライブラリ（`golang.org/x/sys`）に脆弱
 
 ### 配布バイナリの検証
 
-GitHub Releasesに記載したSHA256と、ダウンロードしたファイルのハッシュが一致することを確認してください。
+各リリースに添付される`SHA256SUMS.txt`と、ダウンロードしたファイルのハッシュが
+一致することを確認してください。
 
 ```powershell
-Get-FileHash .\restart-message_0.4.2_windows_amd64.exe -Algorithm SHA256
+$exe = (Get-Item .\restart-message_*_windows_amd64.exe).FullName   # ARM64版は arm64
+(Get-FileHash $exe -Algorithm SHA256).Hash
 ```
 
 一致しない場合は使用せず、報告してください。
+
+ビルド来歴（provenance）の検証を含む詳しい手順は、[README](../README.md)の
+「ダウンロードと検証」を参照してください。
 
 ### 送信される情報
 
