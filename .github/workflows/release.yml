@@ -48,38 +48,73 @@ jobs:
           go vet ./...
           go test ./...
 
+      # amd64 と arm64 の両方を同一ジョブ内でビルドする。matrix にすると vet/test・
+      # チェックサム生成・アップロードまでアーキテクチャごとに分岐してしまい、
+      # SHA256SUMS.txt が 2 つ生成されて互いを上書きする（README と検証手順は
+      # 単一の SHA256SUMS.txt を前提にしている）。ビルドだけを 2 回回すほうが安い。
       - name: Build
         shell: bash
-        env:
-          GOOS: windows
-          GOARCH: amd64
         run: |
           mkdir -p dist
-          out="dist/restart-message_${TAG}_windows_amd64.exe"
-          go build -trimpath -ldflags "-s -w -X main.Version=${TAG}" -o "$out" .
-          echo "ASSET=$out" >> "$GITHUB_ENV"
+          amd64="dist/restart-message_${TAG}_windows_amd64.exe"
+          arm64="dist/restart-message_${TAG}_windows_arm64.exe"
+          # ldflags は 1 本だけ持ち、両アーキテクチャで共有する。同じ文字列を 2 行に
+          # 書くと、実行検査のない arm64 側だけ書き換わったときに Version の埋め込みが
+          # 誰にも気づかれずに壊れる（次のステップの理由も参照）。
+          ldflags="-s -w -X main.Version=${TAG}"
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$ldflags" -o "$amd64" .
+          GOOS=windows GOARCH=arm64 go build -trimpath -ldflags "$ldflags" -o "$arm64" .
+          {
+            echo "ASSET_AMD64=$amd64"
+            echo "ASSET_ARM64=$arm64"
+          } >> "$GITHUB_ENV"
 
       # -ldflags の -X は記号名を間違えても無警告で通る（`-X main.Verison=...` は
       # exit 0）。Version は version サブコマンドだけでなく Discord embed の
       # フッターにも出るため、生成した exe を実際に起動して埋め込みを確認する。
       # version は設定もネットワークも権限も要求しない。
-      - name: Smoke test the built binary
+      #
+      # 実行できるのは amd64 だけ。ランナー(windows-latest)は x64 であり、
+      # windows/arm64 の exe はそのままでは起動できないため、arm64 は
+      # 「うっかり漏れた」のではなく意図的に実行検査を免除している。
+      # ただし ldflags は上のステップで 1 本に統一してあるので、この実行検査は
+      # 「両方のビルドが使った ldflags」を検証していることになる。amd64 の Version が
+      # 正しく埋まっているなら、arm64 の Version も同じ文字列から生成されている。
+      - name: Smoke test the built binary (amd64 only)
         shell: bash
         run: |
-          "$ASSET" version
-          "$ASSET" version | grep -qF "restart-message $TAG"
+          "$ASSET_AMD64" version
+          "$ASSET_AMD64" version | grep -qF "restart-message $TAG"
 
+      # 残る危険は「-o を取り違えて両方 amd64（または両方 arm64）を出力する」ことで、
+      # これは実行検査では捕まらない。exe に埋め込まれたビルド情報を読むだけの
+      # `go version -m` は対象アーキテクチャに依存しないので、両方を同じ形で確かめる
+      # （片側だけ見ると取り違えの向きによっては素通りするため対称に検査する）。
+      # grep に -q を付けないのは、一致した行をログに残して証跡にするため。
+      - name: Verify the target architecture embedded in both binaries
+        shell: bash
+        run: |
+          go version -m "$ASSET_AMD64" | grep -E '^[[:space:]]*build[[:space:]]+GOARCH=amd64'
+          go version -m "$ASSET_ARM64" | grep -E '^[[:space:]]*build[[:space:]]+GOARCH=arm64'
+
+      # 1 つの SHA256SUMS.txt に両アーキテクチャを並べる（sha256sum のバイナリモード
+      # 表記 "*" を含む既定の書式のまま。検証は `sha256sum -c SHA256SUMS.txt`）。
       - name: Generate checksums
         shell: bash
         run: |
           cd dist
-          sha256sum "restart-message_${TAG}_windows_amd64.exe" > SHA256SUMS.txt
+          sha256sum \
+            "restart-message_${TAG}_windows_amd64.exe" \
+            "restart-message_${TAG}_windows_arm64.exe" > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      # subject-path は改行区切りで複数指定できる。配布する両バイナリを来歴の対象にする。
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: ${{ env.ASSET }}
+          subject-path: |
+            ${{ env.ASSET_AMD64 }}
+            ${{ env.ASSET_ARM64 }}
 
       - name: Upload assets to the release
         shell: bash
@@ -89,4 +124,11 @@ jobs:
           # workflow_dispatch でリリース未作成のタグを指定された場合に備えて、無ければ作成する。
           gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || \
             gh release create "$TAG" --repo "$REPO" --title "$TAG" --notes ""
-          gh release upload "$TAG" "$ASSET" dist/SHA256SUMS.txt --clobber --repo "$REPO"
+          # THIRD_PARTY_NOTICES.txt も添付する。golang.org/x/sys は BSD-3-Clause で、
+          # 第2項がバイナリ配布時に「頒布物に付随する文書等」へ著作権表示を再掲するよう
+          # 求めている。実行ファイルはリポジトリと切り離して単体で配られるため、
+          # リポジトリに置いてあるだけでは条件を満たさない。
+          gh release upload "$TAG" \
+            "$ASSET_AMD64" "$ASSET_ARM64" \
+            dist/SHA256SUMS.txt THIRD_PARTY_NOTICES.txt \
+            --clobber --repo "$REPO"

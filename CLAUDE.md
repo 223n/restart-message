@@ -16,11 +16,13 @@ export PATH="/c/Program Files/Go/bin:$PATH"
 ```
 
 ```bash
-go test ./...                          # 全テスト（テストは detect / notify パッケージのみ。非Windowsではルートpkgが黙って除外される）
+go test ./...                          # 全テスト（internal/ の5パッケージすべて。非Windowsではルートpkgが黙って除外される）
 go test -run TestLatest ./internal/detect   # 単一テスト
 go vet ./...                           # 静的検査
 go build -trimpath -ldflags "-s -w" -o bin/restart-message.exe .   # 手動ビルド
 pwsh -File scripts/build.ps1           # 推奨ビルド（bin\restart-message.exe を生成）
+pwsh -File scripts/build.ps1 -Arch arm64   # ARM64版（bin\restart-message_arm64.exe）
+GOOS=windows GOARCH=arm64 go build ./...   # arm64 のコンパイル検査（CIも実行）
 ```
 
 非Windows環境では、`//go:build windows` の付いたファイル（ルートの main / `task_windows` / `service_windows`、および `winevent/winevent.go`）はコンパイルされない。
@@ -68,5 +70,7 @@ pwsh -File scripts/build.ps1           # 推奨ビルド（bin\restart-message.e
 ## ブランチ運用とリリース
 
 - **git-flow (AVH Edition)**: `main`（安定版）/ `develop`（統合）/ `feature/*`・`release/*`・`hotfix/*`。PRの既定ベースは `develop`。
-- リリースはGitHub Releaseをpublishすると [release.yml](.github/workflows/release.yml) がバイナリ・`SHA256SUMS.txt`・provenanceを自動添付。バージョンは `-ldflags "-X main.Version=<tag>"` で埋め込む（既定は `main.go` の `Version`）。
+- リリースはGitHub Releaseをpublishすると [release.yml](.github/workflows/release.yml) が amd64/arm64 のバイナリ・`SHA256SUMS.txt`・`THIRD_PARTY_NOTICES.txt`・provenanceを自動添付。バージョンは `-ldflags "-X main.Version=<tag>"` で埋め込む（既定は `main.go` の `Version`）。
+- **バージョン番号を書く場所は `main.go` の `Version` だけ**。`build.ps1` もREADMEの例もここから導出する（過去に両方で二重管理になり、リリースのたびに古くなっていた）。`THIRD_PARTY_NOTICES.txt` に依存ライブラリの版を書かないのも同じ理由。
+- arm64 バイナリは x64 ランナー上で**実行できない**ため、`release.yml` の起動スモークテストは amd64 限定。arm64 は `go version -m` で `GOARCH` を検査するに留まる。
 - CI: [codeql.yml](.github/workflows/codeql.yml)（Windowsランナーでネイティブビルドして解析）、Dependabot（PRは `develop` 宛）。
