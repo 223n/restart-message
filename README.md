@@ -51,13 +51,13 @@ DiscordのWebhookで通知を送る軽量ツールです。
 ダウンロード後、SHA256が一致することを確認してください。
 
 ```powershell
-Get-FileHash .\restart-message_0.4.1_windows_amd64.exe -Algorithm SHA256
+Get-FileHash .\restart-message_0.4.2_windows_amd64.exe -Algorithm SHA256
 ```
 
 ビルド来歴（provenance）も検証できます（GitHub CLIが必要）。
 
 ```powershell
-gh attestation verify .\restart-message_0.4.1_windows_amd64.exe --repo 223n/restart-message
+gh attestation verify .\restart-message_0.4.2_windows_amd64.exe --repo 223n/restart-message
 ```
 
 ## ビルド
@@ -306,8 +306,11 @@ go vet ./...
 `SHA256SUMS.txt` をビルドして添付し、ビルド来歴（provenance）の署名を付与します。
 
 ```powershell
-# 例: git-flow の release/hotfix を main へマージし、タグを push したのち
-$tag = '0.4.1'
+# git-flow の release/hotfix を main へマージし、タグを push したのち。
+# タグ名は main.go の Version と揃えます。
+$tag = (Select-String -Path main.go -Pattern 'var Version = "(.+)"').Matches.Groups[1].Value
+git tag -a $tag -m "restart-message $tag"
+git push origin $tag
 gh release create $tag --title "restart-message $tag" --notes-file notes.md
 ```
 

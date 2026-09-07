@@ -1,7 +1,7 @@
 # Builds restart-message.exe into ./bin
 # Usage: pwsh -File scripts/build.ps1 [-Version 0.1.0]
 param(
-    [string]$Version = "0.4.1"
+    [string]$Version = "0.4.2"
 )
 
 $ErrorActionPreference = "Stop"
