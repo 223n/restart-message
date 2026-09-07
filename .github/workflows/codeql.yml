@@ -7,12 +7,20 @@ on:
   push:
     branches: ["develop", "main"]
   pull_request:
-    branches: ["develop"]
+    # git-flow では release/* と hotfix/* が main 宛になる。develop だけを対象に
+    # していると、リリース直前のPRが一度も解析されないまま main へ入る。
+    branches: ["develop", "main"]
   schedule:
     - cron: "30 2 * * 1" # 毎週月曜 02:30 UTC
 
 permissions:
   contents: read
+
+# 同一ブランチへ連続 push したときに解析が並走するのを止める。
+# 過去に develop への2コミットが11秒差で並走した実績がある。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   analyze:

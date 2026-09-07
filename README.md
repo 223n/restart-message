@@ -40,7 +40,8 @@ DiscordのWebhookで通知を送る軽量ツールです。
 
 ## 必要要件
 
-- Windows 10 / 11
+- Windows 10 / 11（x64）
+  - 配布している実行ファイルは x64 版のみです。
 - ビルド時のみ: Go 1.26.8以降
 
 ## ダウンロードと検証
@@ -77,6 +78,18 @@ go build -trimpath -ldflags "-s -w" -o bin\restart-message.exe .
 `config.example.json` をコピーして `config.json` を作成します。
 **Webhook URL は秘密情報のため、`config.json` は `.gitignore` 済みです。**
 
+置き場所は用途で決まります。手元で動作確認するだけなら実行ファイルと同じフォルダーに置き、
+タスクやサービスとして登録するなら `%ProgramData%\restart-message\` に置いてください（SYSTEMから読めます）。
+別の場所に置いた場合は `-config` で明示します。
+
+```powershell
+# 手元での動作確認用
+Copy-Item config.example.json .\bin\config.json
+
+# 任意のパスを使う場合
+.\bin\restart-message.exe status -config C:\path\to\config.json
+```
+
 ```json
 {
   "discord_webhook_url": "https://discord.com/api/webhooks/XXXX/YYYY",
@@ -84,7 +97,8 @@ go build -trimpath -ldflags "-s -w" -o bin\restart-message.exe .
   "avatar_url": "",
   "mention": "",
   "notify_on": ["update", "manual", "shutdown", "unexpected", "crash", "unknown"],
-  "include_downtime": true
+  "include_downtime": true,
+  "notify_shutdown_start": true
 }
 ```
 
@@ -128,6 +142,7 @@ restart-message <command> [options]
   uninstall-service 上記サービスを削除（要管理者権限）
   shutdown-notice   シャットダウン前通知を手動で1回送る（動作確認用）
   version           バージョン表示
+  help              このヘルプを表示
 
 共通オプション:
   -config <path>   設定ファイルのパス
@@ -146,6 +161,39 @@ restart-message <command> [options]
 .\bin\restart-message.exe test
 ```
 
+## 実行ファイルの配置
+
+**タスクやサービスを登録する前に、実行ファイルを管理者のみが書き込めるフォルダーへ移してください。**
+
+`install` と `install-service` が登録するタスクとサービスは、SYSTEM・最上位の権限で動きます。
+一般ユーザーが書き込めるフォルダー（`bin\`、ダウンロードフォルダーなど）に実行ファイルを置いたまま登録すると、
+そのフォルダーに書き込める人が誰でもSYSTEM権限を取れる状態になります。
+実行ファイルを差し替えられる場合だけではありません。設定ファイルの探索順の3番目が
+「実行ファイルと同じフォルダーの `config.json`」であるため、同じフォルダーに `config.json` を
+置かれるだけで、SYSTEMで動くプロセスに任意の送信先を渡せます。
+詳細は [SECURITY.md](.github/SECURITY.md) を参照してください。
+
+```powershell
+# 管理者権限の PowerShell で
+New-Item -ItemType Directory -Force -Path 'C:\Program Files\restart-message' | Out-Null
+Copy-Item .\bin\restart-message.exe 'C:\Program Files\restart-message\restart-message.exe'
+```
+
+Releasesから入手した場合は、`restart-message_<version>_windows_amd64.exe` を
+`restart-message.exe` にリネームして同じ場所へ置きます。
+
+一般ユーザーに書き込み権限がないことを確認します。
+
+```powershell
+icacls 'C:\Program Files\restart-message'
+```
+
+`BUILTIN\Users` に `(W)` や `(M)` や `(F)` が付いていないことを確認してください。
+
+以降のインストール手順は、この配置を前提にしています。
+`bin\` から直接実行してよいのは、管理者権限を必要としない `status` / `test` /
+`shutdown-notice` の動作確認だけです。
+
 ## 起動時（復帰時）通知のインストール
 
 再起動後に「PCが起動した／どんな理由で再起動したか」を通知します。
@@ -155,8 +203,8 @@ restart-message <command> [options]
 2. 管理者権限のPowerShellで登録:
 
     ```powershell
-    .\bin\restart-message.exe install
-    # または
+    & 'C:\Program Files\restart-message\restart-message.exe' install
+    # または（実行ファイルを bin\ に置いたままの場合。動作確認用途に限る）
     pwsh -File scripts/install-task.ps1
     ```
 
@@ -169,18 +217,20 @@ restart-message <command> [options]
 アンインストール:
 
 ```powershell
-.\bin\restart-message.exe uninstall
+& 'C:\Program Files\restart-message\restart-message.exe' uninstall
 ```
 
 ## シャットダウン前通知のインストール（サービス）
 
 シャットダウン/再起動の**開始時**に「まもなく落ちます」を通知します。
 Windowsサービスとして常駐し、SCMの **PRESHUTDOWN** 通知
-（既定で約3分の猶予、ネットワークは通常まだ有効）を受けて送信します。
+（ネットワークは通常まだ有効）を受けて送信します。
+猶予はOS既定で約3分ですが、シャットダウンを長く止めないよう、
+`install-service` は登録時に60秒へ明示的に設定します。
 
 ```powershell
 # 管理者権限の PowerShell で
-.\bin\restart-message.exe install-service
+& 'C:\Program Files\restart-message\restart-message.exe' install-service
 ```
 
 - サービス名: `restart-message-svc`（自動起動・LocalSystem）
@@ -197,10 +247,27 @@ Windowsサービスとして常駐し、SCMの **PRESHUTDOWN** 通知
 ### アンインストール
 
 ```powershell
-.\bin\restart-message.exe uninstall-service
+& 'C:\Program Files\restart-message\restart-message.exe' uninstall-service
 ```
 
 `restart-message` のサービスをすべて（旧バージョンの残骸を含めて）停止・削除します。
+
+### 完全に削除する
+
+`uninstall` と `uninstall-service` はタスクとサービスだけを削除します。
+`%ProgramData%\restart-message\` 配下のデータは残るため、**Webhookトークンを含む
+`config.json` がディスク上に残ります**。完全に削除するには次まで行ってください。
+
+```powershell
+# 管理者権限の PowerShell で
+& 'C:\Program Files\restart-message\restart-message.exe' uninstall
+& 'C:\Program Files\restart-message\restart-message.exe' uninstall-service
+Remove-Item -Recurse -Force 'C:\ProgramData\restart-message'
+Remove-Item -Recurse -Force 'C:\Program Files\restart-message'
+```
+
+最後に、Discord側で該当のWebhookを削除するか再生成してください。
+`config.json` を消しても、トークンそのものが無効になるわけではありません。
 
 > **注意（割り込みの限界）:** 電源喪失・バッテリ切れ・ブルースクリーン・
 > `shutdown /f` などの強制終了では、シャットダウン前に割り込めません。
@@ -239,15 +306,21 @@ go vet ./...
 `SHA256SUMS.txt` をビルドして添付し、ビルド来歴（provenance）の署名を付与します。
 
 ```powershell
-# 例: develop で git-flow の release/hotfix を終えてタグを push したのち
-gh release create 0.2.2 --title "restart-message 0.2.2" --notes "..."
+# 例: git-flow の release/hotfix を main へマージし、タグを push したのち
+$tag = '0.4.1'
+gh release create $tag --title "restart-message $tag" --notes-file notes.md
 ```
+
+タグは `main` の先端を指すようにしてください。`release.yml` はタグを ref に
+チェックアウトするため、タグの位置がそのまま配布物の中身になります。
 
 CI:
 
+- `ci.yml` … gofmt / vet / build / test と govulncheck（push / PR / 週次）
 - `codeql.yml` … CodeQLによるコード解析（push / PR / 週次）
 - `dependabot.yml` … 依存更新（PRは `develop` 宛）
 - `release.yml` … リリース公開時のバイナリ・チェックサム・provenance添付
+  - 添付の前に vet / test を通し、生成した実行ファイルを起動してバージョンを確認します
 
 ## ディレクトリ構成
 
@@ -258,12 +331,13 @@ restart-message/
 ├─ service_windows.go          service / install-service（シャットダウン前通知）
 ├─ internal/
 │  ├─ winevent/                Windows イベントログ読取（wevtapi.dll）
+│  │                           record.go はビルドタグなし（Record 型・XMLデコード）
 │  ├─ detect/                  再起動種別の判定（+ テスト）
 │  ├─ notify/                  Discord Webhook 送信（+ テスト）
 │  ├─ config/                  設定読み込み
 │  └─ state/                   通知済み状態の永続化
 ├─ scripts/                    build / install / uninstall (PowerShell)
-├─ .github/                    CodeQL / Dependabot / Release ワークフロー, SECURITY.md
+├─ .github/                    CI / CodeQL / Dependabot / Release ワークフロー, SECURITY.md
 ├─ config.example.json
 └─ README.md
 ```

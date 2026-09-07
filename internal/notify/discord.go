@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -43,8 +44,9 @@ type EmbedFooter struct {
 	Text string `json:"text"`
 }
 
-// HTTPError is returned when Discord responds with a non-2xx status. It never
-// includes the webhook URL (which carries the secret token).
+// HTTPError is returned when the webhook responds with a non-2xx status. It
+// never includes the webhook URL: the status and the response body are kept,
+// but any secret path segment echoed back inside that body is redacted.
 type HTTPError struct {
 	StatusCode int
 	RetryAfter time.Duration // server-requested wait (0 if none)
@@ -88,7 +90,7 @@ func Send(webhookURL string, msg *Message, timeout time.Duration) error {
 		return &HTTPError{
 			StatusCode: resp.StatusCode,
 			RetryAfter: parseRetryAfter(resp, respBody),
-			Body:       string(respBody),
+			Body:       redactToken(string(respBody), webhookURL),
 		}
 	}
 	return nil
@@ -135,6 +137,33 @@ func scrubURLError(err error) error {
 		err = ue.Err
 	}
 	return fmt.Errorf("discord request failed: %w", err)
+}
+
+// minSecretSegment is the shortest webhook path segment treated as secret.
+// Discord's webhook id (17-19 digits) and token (~68 characters) both clear it,
+// while the structural "api" and "webhooks" segments do not.
+const minSecretSegment = 16
+
+// redactToken removes the webhook URL's secret path segments from a response
+// body before that body is stored in an error.
+//
+// Discord itself does not echo the request URL back, but whoever answers is not
+// necessarily Discord. A TLS-terminating proxy on the path can return its own
+// error page with the full request URL embedded, and the service writes that
+// body to %ProgramData%\restart-message\service.log. README states without
+// qualification that the token never reaches logs or error output, so the
+// guarantee is enforced here rather than left to depend on who replied.
+func redactToken(body, webhookURL string) string {
+	u, err := url.Parse(webhookURL)
+	if err != nil {
+		return body
+	}
+	for _, seg := range strings.Split(u.Path, "/") {
+		if len(seg) >= minSecretSegment {
+			body = strings.ReplaceAll(body, seg, "[REDACTED]")
+		}
+	}
+	return body
 }
 
 // maxRetryAfter caps how long a server-provided 429 delay may make us sleep.
