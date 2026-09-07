@@ -50,13 +50,13 @@ DiscordのWebhookで通知を送る軽量ツールです。
 ダウンロード後、SHA256が一致することを確認してください。
 
 ```powershell
-Get-FileHash .\restart-message_0.3.0_windows_amd64.exe -Algorithm SHA256
+Get-FileHash .\restart-message_0.4.0_windows_amd64.exe -Algorithm SHA256
 ```
 
 ビルド来歴（provenance）も検証できます（GitHub CLIが必要）。
 
 ```powershell
-gh attestation verify .\restart-message_0.3.0_windows_amd64.exe --repo 223n/restart-message
+gh attestation verify .\restart-message_0.4.0_windows_amd64.exe --repo 223n/restart-message
 ```
 
 ## ビルド
