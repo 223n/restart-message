@@ -91,7 +91,8 @@ func usage() {
   service           Windows サービスとして実行する（SCM から起動。直接実行不可）
   install-service   シャットダウン前通知のサービスを登録する（要管理者権限）
   uninstall-service 上記サービスを削除する（要管理者権限）
-  shutdown-notice   シャットダウン前通知を手動で1回送る（動作確認用）
+  shutdown-notice   シャットダウン前通知を手動で1回送る（動作確認用。既定では
+                    notify_shutdown_start を尊重。-force で無視して送信）
   version           バージョンを表示
   help              このヘルプを表示
 
