@@ -1,9 +1,13 @@
 package config
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/223n/restart-message/internal/detect"
@@ -90,6 +94,41 @@ func writeProgramDataConfig(t *testing.T, body string) string {
 		t.Fatalf("MkdirAll(%s): %v", dir, err)
 	}
 	return writeConfig(t, filepath.Join(dir, "config.json"), body)
+}
+
+// mkdirExeConfig and mkdirProgramDataConfig plant a *directory* where each
+// search candidate expects a file — what an install script does when it runs one
+// `mkdir -p` too deep. Neither is a config file, and both are removed again when
+// the test ends (ProgramData is a t.TempDir, so only the exe-adjacent one needs
+// explicit cleanup).
+func mkdirExeConfig(t *testing.T) string {
+	t.Helper()
+	p := exeConfigPath(t)
+	if err := os.Mkdir(p, 0o700); err != nil {
+		t.Fatalf("cannot create %s: %v", p, err)
+	}
+	t.Cleanup(func() { os.Remove(p) })
+	return p
+}
+
+func mkdirProgramDataConfig(t *testing.T) string {
+	t.Helper()
+	return tempDir(t, filepath.Join(ProgramDataDir(), "config.json"))
+}
+
+// tempConfigDir plants such a directory in a scratch directory of its own, for
+// the cases where the operator names it directly.
+func tempConfigDir(t *testing.T, name string) string {
+	t.Helper()
+	return tempDir(t, filepath.Join(t.TempDir(), name))
+}
+
+func tempDir(t *testing.T, path string) string {
+	t.Helper()
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatalf("MkdirAll(%s): %v", path, err)
+	}
+	return path
 }
 
 func writeConfig(t *testing.T, path, body string) string {
@@ -265,50 +304,259 @@ func TestLoad_MalformedJSON(t *testing.T) {
 	}
 }
 
-// A file that cannot be read is fatal only when the operator named it: asking
-// for a specific config and silently getting the defaults would be a trap,
-// while a path merely inherited from the environment or a stale ProgramData
-// directory must not stop the notifier from running.
+// A config file the operator named must never be swallowed, and -config and
+// RESTART_MESSAGE_CONFIG are documented (README, SECURITY.md) as equivalent ways
+// to name it — so the same typo has to be as fatal through one channel as
+// through the other. The environment variable is not the exotic channel either:
+// the documented install registers the scheduled task with no -config, so the
+// SYSTEM task's only way to point at a file is the variable.
 //
-// The unreadable file here is a missing one, because permission bits are not
-// portable between Linux and Windows (and a test running as root can read a
-// 0000 file anyway).
-func TestLoad_UnreadableFile(t *testing.T) {
-	cases := []struct {
-		name     string
-		explicit bool
-		wantErr  bool
+// The failure modes exercised here are a missing file and a directory in its
+// place, because permission bits are not portable between Linux and Windows (and
+// a test running as root can read a 0000 file anyway).
+func TestLoad_NamedFileThatCannotBeRead(t *testing.T) {
+	failures := []struct {
+		name  string
+		plant func(t *testing.T) string
 	}{
-		{"explicitly requested path that is not there", true, true},
-		{"resolved path that is not there", false, false},
+		{"the file is not there", func(t *testing.T) string { return filepath.Join(t.TempDir(), "absent.json") }},
+		{"a directory sits in the file's place", func(t *testing.T) string { return tempConfigDir(t, "config.json") }},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			isolate(t)
-			missing := filepath.Join(t.TempDir(), "absent.json")
-			arg := ""
-			if tc.explicit {
-				arg = missing
-			} else {
-				t.Setenv("RESTART_MESSAGE_CONFIG", missing)
-			}
-			cfg, gotPath, err := Load(arg)
-			if tc.wantErr {
+	channels := []struct {
+		name    string
+		useFlag bool
+	}{
+		{"named with -config", true},
+		{"named with RESTART_MESSAGE_CONFIG", false},
+	}
+	for _, f := range failures {
+		for _, ch := range channels {
+			t.Run(f.name+"/"+ch.name, func(t *testing.T) {
+				isolate(t)
+				named := f.plant(t)
+				arg := ""
+				if ch.useFlag {
+					arg = named
+				} else {
+					t.Setenv("RESTART_MESSAGE_CONFIG", named)
+				}
+				cfg, gotPath, err := Load(arg)
 				if err == nil {
 					t.Fatalf("Load = %+v, want an error", cfg)
 				}
 				if cfg != nil {
 					t.Errorf("cfg = %+v, want nil alongside the error", cfg)
 				}
-			} else if err != nil {
-				t.Fatalf("Load: %v, want the missing file to be tolerated", err)
-			} else if !reflect.DeepEqual(cfg, Default()) {
-				t.Errorf("cfg = %+v, want the defaults %+v", cfg, Default())
+				// Nothing was read, so nothing may be named: status prints the returned
+				// path as 「設定ファイル: ...」 next to its warning, and a file that could
+				// not be opened must not be reported there as the one in use.
+				if gotPath != "" {
+					t.Errorf("path = %q, want empty — no file was read", gotPath)
+				}
+				// The path is not lost by that: os.ReadFile's *PathError spells it out,
+				// which is what makes returning it separately unnecessary.
+				if msg := err.Error(); !strings.Contains(msg, named) {
+					t.Errorf("error = %q, want it to name %q", msg, named)
+				}
+			})
+		}
+	}
+}
+
+// The two candidates the tool probes on its own stay lenient about absence — on
+// a fresh install neither exists, and that must not stop the notifier. Something
+// that is there and is not a regular file is the other case: a directory named
+// config.json is a botched install, not "no config here". Neither running the
+// built-in defaults nor quietly demoting to the next candidate would tell the
+// operator that the file they are looking at is being ignored.
+func TestLoad_SearchCandidateMustBeARegularFile(t *testing.T) {
+	t.Run("a directory in ProgramData", func(t *testing.T) {
+		isolate(t)
+		dir := mkdirProgramDataConfig(t)
+		cfg, gotPath, err := Load("")
+		if err == nil {
+			t.Fatalf("Load = %+v, want an error", cfg)
+		}
+		if cfg != nil {
+			t.Errorf("cfg = %+v, want nil alongside the error", cfg)
+		}
+		if gotPath != "" {
+			t.Errorf("path = %q, want empty — nothing was read from it", gotPath)
+		}
+		if msg := err.Error(); !strings.Contains(msg, dir) {
+			t.Errorf("error = %q, want it to name what is in the way, %q", msg, dir)
+		}
+	})
+	t.Run("a directory beside the executable is not demoted to ProgramData", func(t *testing.T) {
+		isolate(t)
+		dir := mkdirExeConfig(t)
+		// A perfectly good lower-priority file exists; falling through to it would
+		// run a config the operator did not choose.
+		writeProgramDataConfig(t, `{"mention": "programdata"}`)
+		cfg, gotPath, err := Load("")
+		if err == nil {
+			t.Fatalf("Load = %+v, want an error", cfg)
+		}
+		if gotPath != "" {
+			t.Errorf("path = %q, want empty — nothing was read from it", gotPath)
+		}
+		if msg := err.Error(); !strings.Contains(msg, dir) {
+			t.Errorf("error = %q, want it to name the broken candidate %q", msg, dir)
+		}
+	})
+}
+
+// Absence is the only reason a probed candidate may be passed over in silence.
+// A stat that fails for any other reason means a config file may well be there
+// and we cannot tell: on the target platform that is an ACL on
+// %ProgramData%\restart-message denying traverse to the SYSTEM identity the
+// scheduled task runs as (ERROR_ACCESS_DENIED — fs.ErrPermission, not
+// fs.ErrNotExist). Falling back to the built-in defaults there runs a different
+// tool than the operator configured: no webhook URL, so `run` at boot notifies
+// nobody and exits 0 doing it.
+//
+// Permission bits are not portable between Linux and Windows (and a test running
+// as root reads a 0000 file anyway), so the trigger here is a regular file
+// planted where the tool's directory belongs, which makes the candidate below it
+// unstattable. What that stat reports differs by OS — ENOTDIR on Linux, whereas
+// Windows answers this shape with ERROR_PATH_NOT_FOUND, which *is* fs.ErrNotExist
+// — so the assertion follows what the host actually reported rather than assuming
+// either one.
+func TestLoad_UnreachableSearchCandidateIsNotAbsence(t *testing.T) {
+	isolate(t)
+	blocked := ProgramDataDir()
+	if err := os.WriteFile(blocked, []byte("a file where the tool's directory belongs"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%s): %v", blocked, err)
+	}
+	candidate := filepath.Join(blocked, "config.json")
+	_, statErr := os.Stat(candidate)
+	if statErr == nil {
+		t.Fatalf("stat %s succeeded; the planted file did not block the path", candidate)
+	}
+	if errors.Is(statErr, fs.ErrNotExist) {
+		// This host cannot tell the two apart for this shape, and absence is the
+		// case where skipping the candidate is right.
+		if _, _, err := Load(""); err != nil {
+			t.Fatalf("Load: %v, want the candidate skipped where the OS reports absence (%v)", err, statErr)
+		}
+		return
+	}
+	cfg, gotPath, err := Load("")
+	if err == nil {
+		t.Fatalf("Load = %+v, want the unreadable candidate reported; stat said: %v", cfg, statErr)
+	}
+	if cfg != nil {
+		t.Errorf("cfg = %+v, want nil alongside the error", cfg)
+	}
+	if gotPath != "" {
+		t.Errorf("path = %q, want empty — nothing was read from it", gotPath)
+	}
+	if msg := err.Error(); !strings.Contains(msg, candidate) {
+		t.Errorf("error = %q, want it to name the candidate %q", msg, candidate)
+	}
+}
+
+// The webhook URL carries a bearer-equivalent token in its path, so the very
+// first hop has to be encrypted: with http the token is on the wire in cleartext
+// before any redirect could upgrade the connection. Loopback is the one
+// exception, because that is how a stub server or a local experiment is
+// addressed.
+func TestLoad_WebhookURLScheme(t *testing.T) {
+	const token = "s3cret-webhook-token"
+	cases := []struct {
+		name string
+		url  string
+		ok   bool
+	}{
+		{"https", "https://discord.example/api/webhooks/1/" + token, true},
+		{"https spelled in upper case", "HTTPS://discord.example/api/webhooks/1/" + token, true},
+		{"http to the loopback address", "http://127.0.0.1:8080/" + token, true},
+		{"http elsewhere in 127.0.0.0/8", "http://127.0.0.2/" + token, true},
+		{"http to localhost", "http://localhost/" + token, true},
+		{"http to the IPv6 loopback address", "http://[::1]:8080/" + token, true},
+		// Accepted AND normalised — see the trimmed-value assertion below. Storing
+		// the padding would push the failure into notify, at notification time.
+		{"padded with whitespace", "  https://discord.example/api/webhooks/1/" + token + "\n", true},
+		{"http to a real host", "http://discord.example/api/webhooks/1/" + token, false},
+		// The loopback exception is decided by parsing the host, so a name that
+		// merely begins with one of the loopback spellings is still remote.
+		{"a host that only starts with the loopback address", "http://127.0.0.1.evil.example/" + token, false},
+		{"a host that only starts with localhost", "http://localhost.evil.example/" + token, false},
+		{"no scheme at all", "discord.example/api/webhooks/1/" + token, false},
+		{"scheme-relative", "//discord.example/api/webhooks/1/" + token, false},
+		{"some other scheme", "ftp://discord.example/api/webhooks/1/" + token, false},
+		// Rejected here rather than left to notify: a URL that will not parse cannot
+		// be shown to be https, and notify would fail only at notification time —
+		// the one moment nobody is watching a console.
+		{"unparsable", "https://discord.example:notaport/" + token, false},
+		// A URL with no host reaches that same unwatched moment, so it is caught
+		// here for the same reason. These are the shapes a truncated paste and a
+		// half-edited config.json produce.
+		{"https with no host at all", "https://", false},
+		{"https with the host edited out", "https:///api/webhooks/1/" + token, false},
+		{"https with a port left behind but no host", "https://:443/" + token, false},
+	}
+	check := func(t *testing.T, url string, ok bool, cfg *Config, err error) {
+		t.Helper()
+		if ok {
+			if err != nil {
+				t.Fatalf("Load: %v, want the URL accepted", err)
 			}
-			// Either way the resolved path is reported, so a caller logging it can
-			// show which file was looked for.
-			if gotPath != missing {
-				t.Errorf("path = %q, want %q", gotPath, missing)
+			// Accepting is not enough: the value handed back has to be one notify
+			// can actually use. Validating a trimmed copy while storing the padded
+			// original would move the failure to notification time, which is what
+			// this check exists to prevent.
+			if want := strings.TrimSpace(url); cfg.WebhookURL != want {
+				t.Fatalf("stored WebhookURL is not normalised: %q, want %q", cfg.WebhookURL, want)
+			}
+			return
+		}
+		if err == nil {
+			t.Fatalf("Load = %+v, want the URL rejected", cfg)
+		}
+		if cfg != nil {
+			t.Errorf("cfg = %+v, want nil alongside the error", cfg)
+		}
+		// The URL is a secret; an operator pasting the error into an issue must not
+		// paste the token with it.
+		if msg := err.Error(); strings.Contains(msg, token) || strings.Contains(msg, url) {
+			t.Errorf("error message leaks the webhook URL: %q", msg)
+		}
+	}
+	for _, tc := range cases {
+		// Both channels, because the check has to look at the effective URL: the
+		// environment variable overrides the file, so validating only what the file
+		// said would leave the override unguarded.
+		t.Run(tc.name+"/from the config file", func(t *testing.T) {
+			isolate(t)
+			p := tempConfig(t, "config.json", `{"discord_webhook_url": `+strconv.Quote(tc.url)+`}`)
+			cfg, _, err := Load(p)
+			check(t, tc.url, tc.ok, cfg, err)
+		})
+		t.Run(tc.name+"/from DISCORD_WEBHOOK_URL", func(t *testing.T) {
+			isolate(t)
+			t.Setenv("DISCORD_WEBHOOK_URL", tc.url)
+			cfg, _, err := Load("")
+			check(t, tc.url, tc.ok, cfg, err)
+		})
+	}
+}
+
+// No webhook at all stays valid: status and a dry run legitimately run without
+// one, and the subcommands that send report the missing URL themselves with a
+// message naming both places it can come from. A variable or key that was
+// declared and never filled in has the same meaning as an absent one.
+func TestLoad_WebhookURLMayBeUnset(t *testing.T) {
+	cases := []struct{ name, body string }{
+		{"key absent", `{"username": "x"}`},
+		{"empty string", `{"discord_webhook_url": ""}`},
+		{"only whitespace", `{"discord_webhook_url": "   \t"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			isolate(t)
+			if _, _, err := Load(tempConfig(t, "config.json", tc.body)); err != nil {
+				t.Fatalf("Load: %v, want a config with no webhook URL to be valid", err)
 			}
 		})
 	}
@@ -497,7 +745,8 @@ func TestLoad_PathPrecedence(t *testing.T) {
 
 // The two file candidates are skipped when the file is not there, rather than
 // being returned and failing to open later. The env var is deliberately not in
-// this list: it is returned unchecked (see TestLoad_UnreadableFile).
+// this list: it is returned unchecked, so that naming a file that is not there
+// fails instead of being skipped (see TestLoad_NamedFileThatCannotBeRead).
 func TestLoad_FileCandidatesRequireExistence(t *testing.T) {
 	t.Run("empty ProgramData directory yields no path", func(t *testing.T) {
 		isolate(t)

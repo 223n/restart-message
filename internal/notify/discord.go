@@ -58,9 +58,62 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("discord webhook returned %d: %s", e.StatusCode, e.Body)
 }
 
-// Permanent reports whether retrying cannot help (4xx other than 429).
+// Permanent reports whether retrying cannot help: a 4xx other than 429, or any
+// 3xx.
+//
+// The 3xx case is load-bearing together with the CheckRedirect hook in Send,
+// and neither half works alone. Send refuses to follow redirects, so a 3xx now
+// surfaces here as an HTTPError instead of being silently followed; without
+// this clause it would count as retryable and SendWithRetry would burn its
+// whole budget, on every boot, against a webhook URL that is misconfigured
+// permanently (wrong scheme, a proxy bouncing to a captive portal). A redirect
+// is the server saying "not here", which no amount of retrying changes.
 func (e *HTTPError) Permanent() bool {
+	if e.StatusCode >= 300 && e.StatusCode < 400 {
+		return true
+	}
 	return e.StatusCode >= 400 && e.StatusCode < 500 && e.StatusCode != http.StatusTooManyRequests
+}
+
+// ErrInvalidRequest marks a failure that happened before anything went on the
+// wire — the webhook URL could not even be turned into a request (malformed,
+// unsupported scheme, a control character in it). Such an input is fatal
+// deterministically: the boot-time retry loop would otherwise sleep through its
+// entire budget re-parsing the same broken string, which is exactly the wait it
+// exists to spend on a network that is not up yet.
+//
+// It is a sentinel rather than another Permanent()-style type because the
+// condition carries nothing worth inspecting: unlike *HTTPError there is no
+// status, no Retry-After, no body — only "this can never succeed" — and
+// errors.Is keeps the check next to the existing *HTTPError one in
+// SendWithRetry without giving callers a second error shape to learn.
+var ErrInvalidRequest = errors.New("invalid webhook request")
+
+// userAgentURL identifies this project to Discord, per its documented
+// "DiscordBot ($url, $versionNumber)" format.
+const userAgentURL = "https://github.com/223n/restart-message"
+
+// UserAgent is sent with every webhook request. Discord's developer
+// documentation requires clients to identify themselves this way and warns that
+// unidentified ones may be blocked with a Cloudflare error — a 403, which
+// Permanent() treats as unretryable, so both notification paths would die after
+// a single attempt on every machine at once.
+//
+// The version component defaults to a placeholder rather than a literal release
+// number on purpose: the version lives in exactly one place in this repository
+// (main.Version), and main is Windows-only, so a copy here would be a second
+// source of truth that silently goes stale. SetUserAgentVersion exists so that
+// main — the one caller that knows the number — can fill it in; until it does,
+// the default is still a valid identification on its own.
+var UserAgent = "DiscordBot (" + userAgentURL + ", 0)"
+
+// SetUserAgentVersion refines UserAgent with the running binary's version. It is
+// meant to be called once at startup, before any Send.
+func SetUserAgentVersion(version string) {
+	if version == "" {
+		return
+	}
+	UserAgent = "DiscordBot (" + userAgentURL + ", " + version + ")"
 }
 
 // Send posts msg to the webhook once. Discord returns 204 on success.
@@ -75,11 +128,62 @@ func Send(webhookURL string, msg *Message, timeout time.Duration) error {
 	}
 	req, err := http.NewRequest(http.MethodPost, webhookURL, bytes.NewReader(body))
 	if err != nil {
-		return scrubURLError(err)
+		// Nothing was sent, so no retry can change the outcome. Still scrubbed:
+		// url.Parse's error stringifies the URL it choked on, token included.
+		return fmt.Errorf("%w: %w", ErrInvalidRequest, scrubURLError(err))
+	}
+	if (req.URL.Scheme != "http" && req.URL.Scheme != "https") || req.URL.Hostname() == "" {
+		// http.NewRequest accepts anything url.Parse accepts, so a webhook URL
+		// written without "https://" gets this far and is only rejected deep inside
+		// client.Do ("unsupported protocol scheme", "no Host in request URL").
+		// There it looks like an ordinary transport error and the retry loop spends
+		// its whole budget on it. It is as deterministic as the parse failure above
+		// and no byte ever leaves the machine, so it stops the loop the same way.
+		//
+		// config.Load screens the same shapes before this package is reached, so
+		// for the binary this is the second of two gates rather than the only one.
+		// It is still this package's job: notify is importable on its own, and a
+		// caller that skips config must not be handed a 3-minute stall instead of
+		// an immediate answer. Hostname() rather than Host, to agree with config —
+		// "https://:443/…" has a non-empty Host and no host at all.
+		// The URL is not quoted back: it carries the token.
+		return fmt.Errorf("%w: webhook URL needs an http:// or https:// scheme and a host", ErrInvalidRequest)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", UserAgent)
 
-	client := &http.Client{Timeout: timeout}
+	client := &http.Client{
+		Timeout: timeout,
+		// Never follow a redirect; hand the 3xx back as the response instead.
+		//
+		// net/http otherwise follows up to 10 hops, and its redirect handling
+		// rewrites a 301/302/303 POST into a GET and DROPS the body. The shape
+		// that made this concrete: a webhook URL written as http://, to which
+		// Discord answers 301 for the https one — and a GET on that path is its
+		// documented "Get Webhook with Token" endpoint, returning 200 with the
+		// webhook object. Send saw 2xx, reported success and posted nothing,
+		// while main wrote state.json and suppressed that boot forever.
+		//
+		// config.Load now rejects a non-https webhook URL, so that particular
+		// route no longer starts here. What remains is every redirect this tool
+		// does not control: a TLS-terminating proxy answering 200 with a block
+		// page, a captive portal 302, a middlebox in front of an https endpoint.
+		// Surfacing the 3xx turns all of them into a visible permanent error
+		// (see HTTPError.Permanent) instead of a success that delivered nothing.
+		//
+		// 307 and 308 are refused as well, and that half is a deliberate trade
+		// rather than a bug fix: they are the two redirects net/http does not
+		// rewrite, so the POST and its body survive the hop and a webhook behind
+		// a 308-issuing proxy used to be delivered correctly. Following one
+		// would forward a request carrying the webhook token to a host the
+		// configuration never named, on the say-so of whoever answered.
+		// Refusing every hop keeps the token inside the configured origin, and
+		// the error names the status so the operator can repoint the config at
+		// the redirect target themselves.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return scrubURLError(err)
@@ -98,14 +202,18 @@ func Send(webhookURL string, msg *Message, timeout time.Duration) error {
 }
 
 // SendWithRetry retries Send to tolerate the network not being ready yet at
-// boot. It stops immediately on a permanent error (e.g. 401/404 bad webhook,
-// 400 invalid payload) and honors a 429 Retry-After delay.
+// boot. It stops immediately on a permanent error (an unusable webhook URL, a
+// redirect, 401/404 bad webhook, 400 invalid payload) and honors a 429
+// Retry-After delay.
 func SendWithRetry(webhookURL string, msg *Message, attempts int, wait time.Duration) error {
 	var last error
 	for i := 0; i < attempts; i++ {
 		last = Send(webhookURL, msg, 20*time.Second)
 		if last == nil {
 			return nil
+		}
+		if errors.Is(last, ErrInvalidRequest) {
+			return last // never reached the network; the input itself is unusable
 		}
 		var he *HTTPError
 		if errors.As(last, &he) && he.Permanent() {

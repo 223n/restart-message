@@ -117,6 +117,13 @@ func sendShutdownNotice(cfgPath string, force bool) error {
 			svcLog(cfgPath, "shutdown notice sent")
 			return nil
 		}
+		// An unusable webhook URL never reached the network, so the second attempt
+		// would re-parse the same broken string — and this path runs while Windows
+		// is waiting to power off, where the 1.5s sleep below is time taken from
+		// the shutdown itself.
+		if errors.Is(err, notify.ErrInvalidRequest) {
+			break
+		}
 		var he *notify.HTTPError
 		if errors.As(err, &he) && he.Permanent() {
 			break
