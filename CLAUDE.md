@@ -64,7 +64,9 @@ GOOS=windows GOARCH=arm64 go build ./...   # arm64 のコンパイル検査（CI
 ### 設定・状態の探索パス
 
 - 設定: `-config` → `RESTART_MESSAGE_CONFIG` → 実行ファイル隣の `config.json` → `%ProgramData%\restart-message\config.json`。Webhook URLは `DISCORD_WEBHOOK_URL` で上書き可。
-- 状態・サービスログ: `%ProgramData%\restart-message\`（`state.json` / `service.log`）。SYSTEM/サービスからも読める場所を使う。
+- `-config` と `RESTART_MESSAGE_CONFIG` は**操作者の明示指定**なので、指すファイルが読めなければエラー。残る2つは探索パスなので不在は許容する（この非対称性は意図的）。
+- `install` / `install-service` は、登録するタスクが実際に解決する設定を検証し、動かない構成なら**登録を拒否**する（`-allow-unconfigured` で上書き）。環境変数はSYSTEMから見えない可能性があるため判定から除外する。
+- 状態・ログ: `%ProgramData%\restart-message\`（`state.json` / `service.log`）。SYSTEM/サービスからも読める場所を使う。`service.log` にはサービスだけでなく**起動時通知（`run`）の結果も1起動につき1行**書く（SYSTEMタスクにはコンソールが無く、以前は失敗が何も残らなかった）。Webhook URL は絶対に書かない。
 - `config.json` は秘密情報を含むため `.gitignore` 済み。テンプレートは `config.example.json`。
 
 ## ブランチ運用とリリース
