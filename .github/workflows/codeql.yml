@@ -84,7 +84,7 @@ jobs:
           ref: ${{ matrix.branch }}
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           # checkout より後に置くこと。分岐時はチェックアウトしたブランチの go.mod を
           # 読ませたい（main と develop で Go のバージョンが違い得る）。
