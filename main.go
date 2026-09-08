@@ -27,7 +27,7 @@ import (
 const configLoadFailed = "\x00load-failed"
 
 // Version is the build version (overridable via -ldflags "-X main.Version=...").
-var Version = "0.5.0"
+var Version = "0.6.0"
 
 func main() {
 	// The version lives only in this file, and notify cannot import it back
