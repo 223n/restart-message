@@ -19,19 +19,36 @@ on:
     # コード変更がなくても脆弱性データベース側の更新だけで落ちるようにするための定期実行。
     # go.mod は `go 1.26.8` とパッチまで固定されており Dependabot は更新しないので、
     # これが「Goを上げる時期」を知る唯一の自動シグナルになる。
+    #
+    # なお schedule は既定ブランチ(develop)でしか起動しない。リリース済みバイナリの
+    # ソースである main を見るために、govulncheck だけ develop と main の2本に
+    # 分岐させている（下の govulncheck ジョブの matrix を参照）。
     - cron: "40 2 * * 1"
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# event_name を鍵に足しているのは、schedule の github.ref が既定ブランチ
+# (refs/heads/develop)になり、develop への push と同じグループに入ってしまうため
+# （workflow_dispatch も develop から起動すれば同じ状況になる。手動実行の github.ref は
+# 「実行」画面で選んだブランチであって、既定ブランチとは限らない）。
+# そのままだと push が「main の govulncheck を回す唯一の実行」を巻き添えでキャンセルし、
+# main は次の月曜まで検査されない。push 同士・PR 同士の相殺はこれまでどおり効く
+# （github.ref が同じで event_name も同じため）。
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
   test:
     name: Build and test
+    # このジョブは定期実行でも分岐させない（トリガーした ref 1本のまま。schedule なら
+    # 既定ブランチの develop）。
+    # ビルド・vet・テストの答えはコードが変わらない限り変わらないため、main を毎週
+    # ビルドし直しても新しい情報は出ない。main が変わるのは release/* と hotfix/* を
+    # 取り込むときだけで、その PR と push で同じ検査がすでに走っている。
+    # 逆に govulncheck は「同じコードでも答えが変わる」ので、そちらだけ分岐させる。
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
@@ -39,7 +56,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
@@ -73,16 +90,55 @@ jobs:
         run: go test ./...
 
   govulncheck:
-    name: govulncheck
+    # 分岐していないとき(push / pull_request)のジョブ名は従来どおり "govulncheck"。
+    # ブランチ保護の必須チェック名を変えないため、ブランチ名は分岐時だけ付ける。
+    name: govulncheck${{ matrix.branch && format(' ({0})', matrix.branch) || '' }}
     runs-on: windows-latest
     timeout-minutes: 15
+    strategy:
+      # develop が落ちても main の結果は知りたいので、片方の失敗で相方を止めない。
+      fail-fast: false
+      matrix:
+        # 定期実行(schedule)のときは develop と main の2本に分岐する。
+        # 脆弱性データベースは毎日更新されるため、同じコードでも時間が経てば答えが
+        # 変わる。main はリリース済みバイナリのソースなので、リリースの翌週に出た
+        # stdlib の脆弱性は「誰かが main を触るまで誰にも見えない」状態だった。
+        #
+        # 手動実行は原則「選んだブランチを検査する」。既定ブランチ(develop)から
+        # 起動したときだけ「定期スキャンを今すぐ回す」とみなして分岐する。
+        # 一律に分岐させると、release/0.6.0 を選んで起動したのに検査されるのは
+        # develop と main、つまり選んだブランチは一度も見ないまま緑になる
+        # （同じ実行の test ジョブは選んだブランチをビルドするので、1回の実行の中で
+        # 別々の ref を見ることにもなる）。マージ前の release/* こそ手動実行を
+        # 使いたい場面なので、そこで黙って別のブランチを見るのは避ける。
+        #
+        # push / pull_request は空文字1件 = 「トリガーした ref をそのまま」なので、
+        # ジョブ数も挙動も従来と同じ（PRのCIを二重に回さない）。
+        branch: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)) && '["develop","main"]' || '[""]') }}
     steps:
+      # 定期実行なのに分岐していない = main が検査されないまま緑になる。気づく手がかりは
+      # ジョブ名が "govulncheck (main)" ではなく "govulncheck" であることだけで、
+      # 「無いものに気づく」必要がある。黙って見逃すより、ここで落として気づけるようにする。
+      # 手動実行は分岐しないのが正常なので、schedule に限定して判定する。
+      - name: Check matrix fan-out
+        if: github.event_name == 'schedule' && matrix.branch == ''
+        shell: bash
+        run: |
+          echo "::error::matrix.branch が空です。定期実行の develop/main 分岐が効いていません"
+          exit 1
+
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # 空文字はこの入力を未指定と同じに扱う(= トリガーした ref)。
+          # 分岐時だけ develop / main を明示的にチェックアウトする。
+          ref: ${{ matrix.branch }}
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
+          # checkout より後に置くこと。分岐時はチェックアウトしたブランチの go.mod を
+          # 読ませたい（main と develop で Go のバージョンが違い得る）。
           go-version-file: go.mod
 
       # バージョンを固定しないのは、脆弱性データベースが常時更新される以上

@@ -35,7 +35,7 @@ func (h *serviceHandler) Execute(args []string, r <-chan svc.ChangeRequest, chan
 	const accepted = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPreShutdown
 	changes <- svc.Status{State: svc.StartPending}
 	changes <- svc.Status{State: svc.Running, Accepts: accepted}
-	svcLog(h.cfgPath, "service running")
+	appLog("service running")
 
 	for {
 		req := <-r
@@ -44,20 +44,20 @@ func (h *serviceHandler) Execute(args []string, r <-chan svc.ChangeRequest, chan
 			changes <- req.CurrentStatus
 		case svc.Stop:
 			changes <- svc.Status{State: svc.StopPending}
-			svcLog(h.cfgPath, "service stopped")
+			appLog("service stopped")
 			return false, 0
 		case svc.PreShutdown, svc.Shutdown:
 			// Advertise a WaitHint above the bounded send budget (and bump
 			// CheckPoint) so the SCM doesn't deem us hung while we block in
 			// sendShutdownNotice.
 			changes <- svc.Status{State: svc.StopPending, WaitHint: 25000, CheckPoint: 1}
-			svcLog(h.cfgPath, fmt.Sprintf("shutdown signal received (cmd=%d)", req.Cmd))
-			if err := sendShutdownNotice(h.cfgPath, false); err != nil {
-				svcLog(h.cfgPath, "shutdown notice error: "+err.Error())
+			appLog(fmt.Sprintf("shutdown signal received (cmd=%d)", req.Cmd))
+			if _, _, err := sendShutdownNotice(h.cfgPath, false); err != nil {
+				appLog("shutdown notice error: " + err.Error())
 			}
 			return false, 0
 		default:
-			svcLog(h.cfgPath, fmt.Sprintf("unexpected control request (cmd=%d)", req.Cmd))
+			appLog(fmt.Sprintf("unexpected control request (cmd=%d)", req.Cmd))
 		}
 	}
 }
@@ -79,20 +79,24 @@ func cmdService(args []string) error {
 }
 
 // sendShutdownNotice posts the pre-shutdown notification. force bypasses the
-// notify_shutdown_start config gate (used by the manual shutdown-notice test).
-// It uses short timeouts so it never holds up shutdown for long; the boot-time
-// notifier is the safety net if delivery fails.
-func sendShutdownNotice(cfgPath string, force bool) error {
+// notify_shutdown_start config gate (shutdown-notice -force). It uses short
+// timeouts so it never holds up shutdown for long; the boot-time notifier is the
+// safety net if delivery fails.
+//
+// sent is false with a nil error when the gate declined, so the manual command
+// can say so instead of printing "送信しました" over a notice that was never
+// sent; skipReason carries the console wording for that case.
+func sendShutdownNotice(cfgPath string, force bool) (sent bool, skipReason string, err error) {
 	cfg, _, err := config.Load(cfgPath)
 	if err != nil {
-		return fmt.Errorf("設定の読み込みに失敗: %w", err)
+		return false, "", fmt.Errorf("設定の読み込みに失敗: %w", err)
 	}
-	if !force && !cfg.NotifyShutdownStart {
-		svcLog(cfgPath, "notify_shutdown_start is disabled; skipping")
-		return nil
+	if send, reason := shutdownNoticeGate(cfg.NotifyShutdownStart, force); !send {
+		appLog("notify_shutdown_start is disabled; skipping")
+		return false, reason, nil
 	}
 	if strings.TrimSpace(cfg.WebhookURL) == "" {
-		return fmt.Errorf("discord_webhook_url が未設定です（config または DISCORD_WEBHOOK_URL）")
+		return false, "", fmt.Errorf("discord_webhook_url が未設定です（config または DISCORD_WEBHOOK_URL）")
 	}
 
 	// Best-effort: classify the in-progress shutdown from the most recent 1074.
@@ -103,7 +107,7 @@ func sendShutdownNotice(cfgPath string, force bool) error {
 			res = r
 		}
 	} else {
-		svcLog(cfgPath, "event query failed: "+qerr.Error())
+		appLog("event query failed: " + qerr.Error())
 	}
 
 	msg := buildPendingMessage(cfg, res)
@@ -114,8 +118,15 @@ func sendShutdownNotice(cfgPath string, force bool) error {
 	for i := 0; i < 2; i++ {
 		err = notify.Send(cfg.WebhookURL, msg, 8*time.Second)
 		if err == nil {
-			svcLog(cfgPath, "shutdown notice sent")
-			return nil
+			appLog("shutdown notice sent")
+			return true, "", nil
+		}
+		// An unusable webhook URL never reached the network, so the second attempt
+		// would re-parse the same broken string — and this path runs while Windows
+		// is waiting to power off, where the 1.5s sleep below is time taken from
+		// the shutdown itself.
+		if errors.Is(err, notify.ErrInvalidRequest) {
+			break
 		}
 		var he *notify.HTTPError
 		if errors.As(err, &he) && he.Permanent() {
@@ -125,7 +136,7 @@ func sendShutdownNotice(cfgPath string, force bool) error {
 			time.Sleep(1500 * time.Millisecond)
 		}
 	}
-	return err
+	return false, "", err
 }
 
 // cmdInstallService registers the service (auto-start, LocalSystem) and starts
@@ -136,6 +147,7 @@ func sendShutdownNotice(cfgPath string, force bool) error {
 func cmdInstallService(args []string) error {
 	fs := flag.NewFlagSet("install-service", flag.ExitOnError)
 	cfgPath := fs.String("config", "", "サービスが使用する設定ファイルのパス")
+	allowUnconfigured := fs.Bool("allow-unconfigured", false, "設定を解決できなくてもサービスを登録する")
 	fs.Parse(args)
 
 	exe, err := os.Executable()
@@ -143,6 +155,24 @@ func cmdInstallService(args []string) error {
 		return err
 	}
 	exe, _ = filepath.Abs(exe)
+
+	// Same absolute path for the check and for the service arguments; a failure
+	// to make it absolute must not silently degrade into "no -config".
+	absCfg := ""
+	if *cfgPath != "" {
+		absCfg, err = filepath.Abs(*cfgPath)
+		if err != nil {
+			return fmt.Errorf("-config のパスを絶対パスに変換できません: %w", err)
+		}
+	}
+	// The same refusal as install, and it matters more here: this service reads
+	// its configuration lazily at PRESHUTDOWN, not at start, so an unconfigured
+	// registration starts cleanly, reports success, and looks healthy in
+	// services.msc until the first real shutdown — the one moment it cannot be
+	// retried.
+	if err := installGate(absCfg, true, *allowUnconfigured); err != nil {
+		return err
+	}
 
 	m, err := mgr.Connect()
 	if err != nil {
@@ -157,9 +187,8 @@ func cmdInstallService(args []string) error {
 	}
 
 	svcArgs := []string{"service"}
-	if *cfgPath != "" {
-		abs, _ := filepath.Abs(*cfgPath)
-		svcArgs = append(svcArgs, "-config", abs)
+	if absCfg != "" {
+		svcArgs = append(svcArgs, "-config", absCfg)
 	}
 
 	svcCfg := mgr.Config{
@@ -190,7 +219,7 @@ func cmdInstallService(args []string) error {
 	// Explicit pre-shutdown grace, comfortably above our bounded send budget
 	// (the OS default is 180s; we set it explicitly for clarity/robustness).
 	if perr := setPreshutdownTimeout(s.Handle, 60_000); perr != nil {
-		svcLog(*cfgPath, "set preshutdown timeout failed: "+perr.Error())
+		appLog("set preshutdown timeout failed: " + perr.Error())
 	}
 
 	if err := s.Start(); err != nil {
@@ -251,7 +280,7 @@ func removeOwnServices(m *mgr.Mgr, exe string) []string {
 	var removed []string
 	for _, name := range names {
 		if derr := removeService(m, name); derr != nil {
-			svcLog("", fmt.Sprintf("remove existing service %q failed: %v", name, derr))
+			appLog(fmt.Sprintf("remove existing service %q failed: %v", name, derr))
 			fmt.Printf("既存サービス %q の削除に失敗（続行します）: %v\n", name, derr)
 			continue
 		}
@@ -330,7 +359,7 @@ func removeService(m *mgr.Mgr, name string) error {
 	st, cerr := s.Control(svc.Stop)
 	alreadyStopped := errors.Is(cerr, windows.ERROR_SERVICE_NOT_ACTIVE)
 	if cerr != nil && !alreadyStopped {
-		svcLog("", fmt.Sprintf("stop %q during removal: %v", name, cerr))
+		appLog(fmt.Sprintf("stop %q during removal: %v", name, cerr))
 	}
 	if !alreadyStopped {
 		deadline := time.Now().Add(10 * time.Second)
@@ -338,13 +367,13 @@ func removeService(m *mgr.Mgr, name string) error {
 			time.Sleep(300 * time.Millisecond)
 			q, qerr := s.Query()
 			if qerr != nil {
-				svcLog("", fmt.Sprintf("query %q during removal: %v; deleting anyway", name, qerr))
+				appLog(fmt.Sprintf("query %q during removal: %v; deleting anyway", name, qerr))
 				break
 			}
 			st = q
 		}
 		if st.State != svc.Stopped {
-			svcLog("", fmt.Sprintf("service %q not Stopped before delete (state=%d); may end up marked-for-deletion", name, st.State))
+			appLog(fmt.Sprintf("service %q not Stopped before delete (state=%d); may end up marked-for-deletion", name, st.State))
 		}
 	}
 
@@ -370,18 +399,4 @@ type servicePreshutdownInfo struct {
 func setPreshutdownTimeout(h windows.Handle, ms uint32) error {
 	info := servicePreshutdownInfo{PreshutdownTimeout: ms}
 	return windows.ChangeServiceConfig2(h, windows.SERVICE_CONFIG_PRESHUTDOWN_INFO, (*byte)(unsafe.Pointer(&info)))
-}
-
-// svcLog appends a diagnostic line to %ProgramData%\restart-message\service.log.
-func svcLog(cfgPath, msg string) {
-	dir := config.ProgramDataDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return
-	}
-	f, err := os.OpenFile(filepath.Join(dir, "service.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	fmt.Fprintf(f, "%s %s\n", time.Now().Format("2006-01-02 15:04:05"), msg)
 }

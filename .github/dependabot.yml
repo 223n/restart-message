@@ -1,8 +1,22 @@
 # Dependabot 設定
 #
-# このファイルは既定ブランチ(main)から読み込まれます。
-# target-branch を develop にしているため、更新 PR は develop に対して作成されます。
-# 参考: https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+# このファイルは既定ブランチからしか読み込まれません。このリポジトリの既定ブランチは
+# develop なので、設定を変えるときは develop 側を直すこと。main 側の
+# .github/dependabot.yml を編集しても Dependabot の挙動は何も変わりません。
+#
+# 既定ブランチが develop である以上 target-branch: "develop" は今は冗長ですが、明示した
+# まま残しています。既定ブランチを main に変えたときに、更新 PR の宛先が黙って main へ
+# 移るのを防ぐためです（git-flow では main に直接 PR を積まない）。
+#
+# ただし無料の保険ではありません。target-branch が既定ブランチ以外を指す状態になると、
+# このファイルの設定（ラベル・コミットメッセージ・グループ化など）は Dependabot の
+# security update には適用されなくなります（version update にのみ効く）。GitHub も
+# security update の設定では target-branch を指定しないよう案内しています。
+# つまり「既定ブランチを main に変える」ときは、この行を develop のまま放置せず、
+# 必ず併せて見直すこと。放置すると、更新 PR の宛先を守る代わりに security update が
+# この設定の外に出ます。
+# 参考: https://docs.github.com/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+#       https://docs.github.com/code-security/dependabot/dependabot-security-updates/configuring-dependabot-security-updates
 version: 2
 updates:
   # Go モジュール (go.mod / go.sum)

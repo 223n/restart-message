@@ -14,6 +14,27 @@ on:
         description: "対象のリリースタグ (例: 0.2.2)"
         required: true
 
+# アクションのバージョンを SHA へ固定していないのは、見落としではなく判断の結果です。
+# このジョブは contents: write / id-token: write / attestations: write を同時に持つため、
+# タグを付け替えられたアクションが Build と Attest の間で dist\*.exe を差し替えれば、
+# GitHub はその差し替えられたバイトに対して「本物の」provenance を発行してしまいます。
+# それでも floating な major タグ (@v7 など) のままにする理由:
+#   - 使っているのは actions/* だけで、2025年3月の tj-actions/changed-files のような
+#     第三者アクションを持ち込んでいない。
+#   - SHA 固定は発生確率を下げるだけで、起きたときの被害範囲は変えられない。
+#   - .github/dependabot.yml が github-actions を週次・グループ1本で追跡しているため、
+#     SHA へ固定すると、アクションのパッチ更新を拾うたびに pin を書き換える更新 PR が
+#     積み上がる（floating な major タグなら major 更新のときしか出ない）。固定は
+#     「誰も中身を読まない更新 PR」を増やす方向にも働く。
+# なお、固定していない外部コードはアクションだけではない。このジョブは Build の前に
+# `go run golang.org/x/vuln/cmd/govulncheck@latest` も実行している。これはアクションでは
+# ないが、リリース時に解決される固定していない外部コードを同じ権限下で走らせている点は
+# 同じである（モジュールの内容は sum.golang.org で検証されるが、どのバージョンが来るかは
+# 固定していない。固定しない理由は Run govulncheck ステップのコメントを参照）。
+# 固定を検討するときは、アクションと合わせて判断すること。
+# 前提が変わったとき（第三者アクションを追加する、provenance をリリースの唯一の信頼点に
+# 据えるなど）は、この判断ごと見直してください。
+
 permissions:
   contents: write # リリースへのアセット追加
   id-token: write # provenance 署名
@@ -33,9 +54,54 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
+          # 既定の shallow clone (fetch-depth: 1) では main の履歴が無く、次のステップの
+          # 祖先判定が「main 上にある正しいタグ」まで落としてしまう。
+          # （実測: タグを --depth 1 でクローンすると refs/tags/<tag> しか無く origin/main が
+          # 存在しないため、祖先判定は 1 ではなく 128 で落ちる。main だけを別途 fetch しても
+          # 履歴は浅いままなので、main 上にある 0.4.2 が exit 1 =「main 上に無い」と判定される。
+          # --unshallow して初めて exit 0 になる）
+          # 0 は「すべてのブランチ・タグの全履歴」を意味し、origin/main も取得される。
+          fetch-depth: 0
+
+      # タグが main の履歴上にあることを確認してから、ビルド・署名・公開へ進む。
+      #
+      # リリースの target_commitish は既定ブランチ、つまり develop になる。これはタグを
+      # 先に push してあるあいだは無害だが、タグが無い状態でリリースを公開すると
+      # （push し忘れ、あるいはリリース画面の「公開時にタグを作成」）、GitHub は develop の
+      # 先端にタグを作る。このワークフローはそのタグを ref にチェックアウトするため、
+      # 未リリースの統合ブランチのコードが、SYSTEM 権限で動くバイナリとして署名・配布される。
+      # README は「タグは main の先端を指すこと」と書いているが、強制する仕組みは無かった。
+      #
+      # release: published で起動した場合、リリースページ自体はこの時点ですでに公開されて
+      # いるため、ここで止められるのはバイナリと provenance の添付までである。
+      # 逆に言えば、署名済みの成果物が出回ることは防げる。
+      - name: Verify the tag is on main
+        shell: bash
+        run: |
+          # 履歴が浅いままだと、祖先判定は「main 上に無い」ではなく「履歴が繋がっていない」
+          # ことを理由に失敗する。設定の誤りを検知の失敗と取り違えないよう先に確かめる。
+          if [ "$(git rev-parse --is-shallow-repository)" != "false" ]; then
+            echo "::error::履歴が浅いためタグの位置を検証できません。checkout の fetch-depth: 0 を確認してください。"
+            exit 1
+          fi
+          if ! git rev-parse --verify --quiet origin/main >/dev/null; then
+            echo "::error::origin/main を取得できていないためタグの位置を検証できません。"
+            exit 1
+          fi
+          # merge-base --is-ancestor は祖先なら 0、そうでなければ 1 を返す。同一コミットも
+          # 祖先として扱われるので、main の先端に付けたタグ（通常のリリース）は通る。
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::タグ $TAG ($(git rev-parse --short HEAD)) は main の履歴上にありません。"
+            echo "タグを push せずにリリースを公開すると、GitHub は既定ブランチ (develop) の先端にタグを作ります。"
+            echo "その場合は未リリースの統合ブランチのコードを配布することになるため、ここで中止しました。"
+            echo "対処: このリリースとタグを削除し、release/* または hotfix/* を main へマージしたうえで、"
+            echo "main の先端にタグを付け直して push し、そのタグでリリースを作成し直してください。"
+            exit 1
+          fi
+          echo "タグ $TAG ($(git rev-parse --short HEAD)) は main の履歴上にあります。"
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
@@ -47,6 +113,25 @@ jobs:
         run: |
           go vet ./...
           go test ./...
+
+      # 既知の脆弱性の検査だけは、他の検査と違って「コミットの関数」ではなく
+      # 「時刻の関数」になる。CI は push / PR と週次で回るので、develop で最後に検査した
+      # あとに標準ライブラリの脆弱性が公表されていれば、コミットが 1 行も変わっていなくても
+      # 結果は変わる。ここで回さないと、その間に公表された脆弱性を含むバイナリを署名・添付
+      # して配ってしまい、しかも誰も異議を唱えない。
+      # SECURITY.md は「影響があれば再ビルドしたリリースで対応する」と約束しており、
+      # go.mod が `go 1.26.8` とパッチまで固定されているのも、govulncheck に修正済みの
+      # 標準ライブラリを見せるためである。
+      #
+      # 呼び出し方は ci.yml と揃える。バージョンを固定しないのは、解析側の改善（新しい
+      # 呼び出し解析や誤検知の修正）を取り込み続けたいため。脆弱性データベースそのものは
+      # 実行のたびに vuln.go.dev から取得する（`-db` の既定値）ので、ツールを固定しても
+      # データが古くなるわけではない。固定するかどうかは、permissions の前にある
+      # 「固定していない外部コード」の判断と合わせて決めること。
+      # windows ランナー上でそのまま実行するので `//go:build windows` のコードも検査対象に入る。
+      # 実測では 30 秒強（ci.yml の Run govulncheck ステップは 2026-09-08 の 2 回とも 32 秒）。
+      - name: Run govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
       # amd64 と arm64 の両方を同一ジョブ内でビルドする。matrix にすると vet/test・
       # チェックサム生成・アップロードまでアーキテクチャごとに分岐してしまい、
@@ -122,8 +207,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # workflow_dispatch でリリース未作成のタグを指定された場合に備えて、無ければ作成する。
+          # 必ず下書き (--draft) で作る。以前は下書きでなかったため、本文が空のリリースが
+          # そのまま公開されていた（0.4.0 が実例。本文なし、タイトルは "restart-message 0.4.0"
+          # ではなく "0.4.0"、作成者は github-actions[bot]）。下書きにしておけば、資産の添付後に
+          # 人がリリースノートを書いてから公開できる。
+          # gh は `releases/tags/{tag}` が 404 のとき GraphQL の release(tagName:) で下書きも
+          # 探すため、続く gh release view / gh release upload は下書きでもタグ名で解決できる。
+          #
+          # 副作用として、この経路はジョブを2回走らせる。GITHUB_TOKEN で作ったリリースは
+          # ワークフローを起動しないため、下書きを作った時点では何も起きない。しかし後から
+          # 人がその下書きを公開すると release: published が発火し、チェックアウトから
+          # アップロードまで一式が再実行される（provenance も同じダイジェストに対して
+          # もう一度発行され、アセットは --clobber で上書きされる）。無害だが、
+          # 「1タグにつき1実行」ではなくなることは知っておくこと。
           gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || \
-            gh release create "$TAG" --repo "$REPO" --title "$TAG" --notes ""
+            gh release create "$TAG" --repo "$REPO" --title "$TAG" --notes "" --draft
           # THIRD_PARTY_NOTICES.txt も添付する。golang.org/x/sys は BSD-3-Clause で、
           # 第2項がバイナリ配布時に「頒布物に付随する文書等」へ著作権表示を再掲するよう
           # 求めている。実行ファイルはリポジトリと切り離して単体で配られるため、
