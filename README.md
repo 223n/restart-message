@@ -191,15 +191,19 @@ restart-message <command> [options]
   service           Windows サービスとして実行（SCM から起動）
   install-service   シャットダウン前通知のサービスを登録（要管理者権限）
   uninstall-service 上記サービスを削除（要管理者権限）
-  shutdown-notice   シャットダウン前通知を手動で1回送る（動作確認用）
+  shutdown-notice   シャットダウン前通知を手動で1回送る（動作確認用。既定では
+                    notify_shutdown_start を尊重。-force で無視して送信）
   version           バージョン表示
   help              このヘルプを表示
 
 共通オプション:
   -config <path>   設定ファイルのパス
-  -state  <path>   状態ファイルのパス
+  -state  <path>   状態ファイルのパス（run）
   -force           状態を無視して必ず通知する（run）
+                   notify_shutdown_start が false でも送信する（shutdown-notice）
   -dry-run         送信せず内容のみ表示する（run）
+  -allow-unconfigured
+                   設定を解決できなくても登録する（install / install-service）
 ```
 
 動作確認の例:
@@ -292,9 +296,22 @@ Windowsサービスとして常駐し、SCMの **PRESHUTDOWN** 通知
 
 ### 事前の動作確認（実際に再起動せずに1回送る）
 
+サービスが実際に行う判断をそのまま再現します。`notify_shutdown_start` が `false` の
+場合は**送信せずにその旨を表示します**。サービスも同じ条件で送信しないため、これが
+正しい確認結果です。
+
 ```powershell
-.\bin\restart-message.exe shutdown-notice
+& "C:\Program Files\restart-message\restart-message.exe" shutdown-notice
 ```
+
+設定に関わらず1通送って疎通だけを見たい場合は `-force` を付けます。
+
+```powershell
+& "C:\Program Files\restart-message\restart-message.exe" shutdown-notice -force
+```
+
+> インストール先の実行ファイルで確認してください。`bin\` のコピーは隣の
+> `bin\config.json` を読むため、サービスが実際に読む設定とは別のファイルになります。
 
 ### アンインストール
 
@@ -328,7 +345,21 @@ Remove-Item -Recurse -Force 'C:\Program Files\restart-message'
 
 ### ログ
 
-サービスの動作は `%ProgramData%\restart-message\service.log` に記録されます。
+サービスの動作と、**起動時通知（`run`）の結果**が
+`%ProgramData%\restart-message\service.log` に記録されます。
+
+起動時通知はタスクスケジューラからSYSTEM権限で動くためコンソールがなく、
+以前は失敗しても何も残りませんでした。1回の起動につき1行が追加されます。
+
+```text
+2026-09-08 09:01:23 run: outcome=sent category=update config=C:\ProgramData\restart-message\config.json
+2026-09-08 09:01:23 run: outcome=send-failed category=manual config=... error=...
+2026-09-08 09:01:23 run: outcome=skipped-already-notified category=update config=...
+```
+
+`outcome` は通知が送られなかった理由を区別するためのものです。設定による意図的な
+スキップ（`skipped-not-in-notify_on`）と失敗（`send-failed`・`no-webhook`・
+`config-error`）を取り違えずに済みます。Webhook URL は記録されません。
 
 ## 通知される情報
 
