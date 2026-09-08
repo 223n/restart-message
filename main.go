@@ -21,10 +21,19 @@ import (
 	"github.com/223n/restart-message/internal/winevent"
 )
 
+// configLoadFailed is passed to printResult in place of a path when config.Load
+// returned an error. It cannot collide with a real path: Load returns either a
+// path it actually read or the empty string.
+const configLoadFailed = "\x00load-failed"
+
 // Version is the build version (overridable via -ldflags "-X main.Version=...").
 var Version = "0.5.0"
 
 func main() {
+	// The version lives only in this file, and notify cannot import it back
+	// (main is the program). Hand it over once, before anything can send.
+	notify.SetUserAgentVersion(Version)
+
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
@@ -195,11 +204,19 @@ func cmdStatus(args []string) error {
 	if cerr != nil {
 		fmt.Fprintf(os.Stderr, "warning: 設定の読み込みに失敗しました: %v\n", cerr)
 	}
+	// Load returns an empty path on failure — nothing was applied, so naming a file
+	// would claim it is in use. But printing the empty case's 「(なし — 既定値を使用)」
+	// here would contradict the warning just above: the defaults are NOT in use
+	// either, because Load returned no config at all.
+	cfgState := cfgUsed
+	if cerr != nil {
+		cfgState = configLoadFailed
+	}
 	_, res, err := collect(1)
 	if err != nil {
 		return err
 	}
-	printResult(res, cfgUsed)
+	printResult(res, cfgState)
 	return nil
 }
 
@@ -281,10 +298,13 @@ func printResult(res *detect.Result, cfgPath string) {
 	if res.Detail != "" {
 		fmt.Printf("  詳細        : %s\n", res.Detail)
 	}
-	if cfgPath != "" {
-		fmt.Printf("  設定ファイル: %s\n", cfgPath)
-	} else {
+	switch cfgPath {
+	case configLoadFailed:
+		fmt.Printf("  設定ファイル: (読み込み失敗 — 上の warning を参照)\n")
+	case "":
 		fmt.Printf("  設定ファイル: (なし — 既定値を使用)\n")
+	default:
+		fmt.Printf("  設定ファイル: %s\n", cfgPath)
 	}
 }
 
