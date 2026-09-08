@@ -201,14 +201,27 @@ func Send(webhookURL string, msg *Message, timeout time.Duration) error {
 	return nil
 }
 
+// sendTimeout bounds a single attempt inside SendWithRetry — the whole exchange,
+// connect through body read, since that is what http.Client.Timeout covers.
+//
+// It is a named constant rather than a literal because the retry loop's
+// worst-case duration is computed from it (WorstCaseDuration) against a hard
+// deadline set outside this package; that arithmetic has to track the real
+// value, not a copy of it.
+const sendTimeout = 20 * time.Second
+
 // SendWithRetry retries Send to tolerate the network not being ready yet at
 // boot. It stops immediately on a permanent error (an unusable webhook URL, a
-// redirect, 401/404 bad webhook, 400 invalid payload) and honors a 429
-// Retry-After delay.
+// redirect, 401/404 bad webhook, 400 invalid payload) and honors a
+// server-requested Retry-After delay, clamped to maxRetryAfter.
+//
+// The loop sleeps between attempts but never after the last one, so a call costs
+// at most attempts*sendTimeout + (attempts-1)*max(wait, maxRetryAfter). That
+// bound is not academic: see maxRetryAfter for the deadline it has to fit inside.
 func SendWithRetry(webhookURL string, msg *Message, attempts int, wait time.Duration) error {
 	var last error
 	for i := 0; i < attempts; i++ {
-		last = Send(webhookURL, msg, 20*time.Second)
+		last = Send(webhookURL, msg, sendTimeout)
 		if last == nil {
 			return nil
 		}
@@ -275,15 +288,124 @@ func redactToken(body, webhookURL string) string {
 	return body
 }
 
-// maxRetryAfter caps how long a server-provided 429 delay may make us sleep.
-const maxRetryAfter = 60 * time.Second
+// maxRetryAfter caps how long a server-provided delay may make SendWithRetry
+// sleep between attempts. It is a scheduling constraint, not a politeness knob:
+// the value is derived from the budget the boot-time notifier runs inside.
+//
+//	worst case = attempts*sendTimeout + (attempts-1)*max(wait, maxRetryAfter)
+//
+// The boot path is the `run` command under the scheduled task registered by
+// task_windows.go, whose <ExecutionTimeLimit>PT10M</ExecutionTimeLimit> together
+// with AllowHardTerminate=true gives the whole process 600s before Windows kills
+// it mid-flight — after which nothing is delivered and nothing records why. main
+// calls SendWithRetry(..., 12, 15*time.Second), and cmdRun spends up to ~25s in
+// collect(6) before ever reaching it. At 20s the arithmetic is:
+//
+//	12*20s + 11*max(15s, 20s) = 460s, plus ~25s of collect = 485s — 115s of margin.
+//
+// At the previous 60s the same worst case was 12*20s + 11*60s = 900s, and a
+// server answering instantly with "Retry-After: 60" still cost 11*60s = 660s: over
+// the limit on the sleeps alone, which is how this was found.
+//
+// Three of those numbers live outside this package: the attempt count and the
+// base wait at main.go's SendWithRetry call site, and the task's
+// ExecutionTimeLimit in task_windows.go. Raising any of them without redoing this
+// arithmetic is what the budget test in discord_test.go exists to catch.
+//
+// That test measures against a ceiling deliberately stricter than the bare 600s:
+// the limit, minus ~30s for collect(6), minus a 60s discretionary margin — 510s.
+// The strictness is the point, so read the next paragraph before touching either
+// subtrahend, because relaxing them is the one repair that quietly undoes this.
+//
+// task_windows.go works the same sum from its own end and reaches
+// 25 + 240 + 11*30 = 595s, "just inside PT10M". Both figures are right; they
+// answer different questions. 595 <= 600 answers "does the arithmetic fit at
+// all", and by that test 30s is the largest cap admissible. This constant answers
+// the stricter one: 595 of 600 leaves five seconds for six wevtapi queries that
+// carry no timeout of their own, on a machine one minute into boot, plus process
+// start, config load and the state file. Five seconds is rounding error, not
+// margin. So a cap of 30s is arithmetically legal and still rejected here on
+// purpose — and when the budget test goes red the fix is this constant, never a
+// bigger bootBudgetMargin.
+//
+// There is deliberately no override for this cap. Anyone able to raise it could
+// re-create exactly the hard termination it prevents, and nothing legitimate
+// needs it: Discord's webhook bucket is 5 requests per 2 seconds and this tool
+// sends one message per boot, so the retry_after values it can actually earn sit
+// far below 20s. A server demanding more is asking for a wait that no longer fits
+// in the task at all — the honest fix there is to raise the task's time limit and
+// this cap together, which is the pair named above.
+const maxRetryAfter = 20 * time.Second
 
-// parseRetryAfter reads the Retry-After header (seconds) or the JSON body's
-// retry_after field (seconds) from a 429 response, clamped to a sane maximum.
+// WorstCaseDuration reports the longest wall-clock time a SendWithRetry call can
+// take for a given attempt count and base wait: every attempt burning its full
+// timeout, every gap using the longest sleep a server is able to ask for. JSON
+// marshalling and request setup are microseconds and ignored.
+//
+// It exists so that the budget written out in maxRetryAfter's comment is a
+// checked claim rather than prose that quietly goes stale — discord_test.go
+// asserts it against the scheduled task's execution limit. Keep it in step with
+// the loop in SendWithRetry: the (attempts-1) is that loop's "no sleep after the
+// final attempt", and the max() is its Retry-After-beats-base-wait rule.
+//
+// It is exported for one reason: three of the numbers that decide whether the
+// bound holds live in //go:build windows files this package cannot import, so
+// discord_test.go restates them by hand, and a hand-copy that drifts *smaller*
+// than reality would leave that test green while a real boot run overruns and is
+// hard-terminated. Nothing in this package can catch that. The windows-tagged
+// TestBootRunFitsTheScheduledTaskLimit in package main does: it reads main.go's
+// own bootSendAttempts/bootSendWait and task_windows.go's own
+// executionTimeLimit, and CI runs it on windows-latest. This export is what lets
+// that test reuse the formula instead of copying it next to the constants —
+// which would put the drift back, one level down.
+func WorstCaseDuration(attempts int, wait time.Duration) time.Duration {
+	if attempts <= 0 {
+		return 0
+	}
+	sleep := wait
+	if maxRetryAfter > sleep {
+		sleep = maxRetryAfter
+	}
+	return time.Duration(attempts)*sendTimeout + time.Duration(attempts-1)*sleep
+}
+
+// parseRetryAfter reads the Retry-After header — in either form RFC 9110 §10.2.3
+// defines, delta-seconds or an HTTP-date — or else the JSON body's retry_after
+// field (seconds), clamped to maxRetryAfter.
+//
+// The delay is taken from any non-2xx response rather than from a 429 alone, and
+// that stays deliberate. Permanent() ends the loop for every 3xx and every 4xx
+// but 429, so in practice the statuses whose delay reaches a time.Sleep are 429
+// and 5xx — and RFC 9110 defines Retry-After for 503 in the same terms as for
+// 429. A Cloudflare or proxy 503 in front of Discord carrying a delay is a real
+// signal about when the endpoint returns; narrowing this to 429 would discard it
+// and buy no safety, because the clamp rather than the status check is what
+// bounds what a hostile value can do. Permanent() screens neither 1xx nor
+// anything above 599, so those reach the sleep as well — and are bounded by that
+// same clamp, which is the point: the ceiling does not depend on enumerating
+// statuses correctly.
 func parseRetryAfter(resp *http.Response, body []byte) time.Duration {
 	if v := resp.Header.Get("Retry-After"); v != "" {
 		if secs, err := strconv.ParseFloat(v, 64); err == nil {
 			return clampRetryAfter(secs)
+		}
+		// The date form, which is the one CDNs and reverse proxies most often
+		// emit — i.e. exactly the 503-in-front-of-Discord responder this reads a
+		// non-429 delay for at all. Without this branch that header parses as
+		// nothing and the loop silently falls back to its base wait.
+		//
+		// The result needs no bound of its own because it goes through the same
+		// clamp: a date far in the future caps at maxRetryAfter, and one already
+		// past floors to 0. That floor is what makes this safe on the machine
+		// this tool actually runs on — one minute into boot, quite possibly
+		// before w32time has synced, so a local clock running ahead of the
+		// server's turns the delay negative rather than into a wait.
+		//
+		// Like the delta-seconds branch it returns rather than falling through,
+		// so a date the server sent wins over a retry_after in the body; that is
+		// the same header-beats-body precedence the numeric form already had.
+		if t, err := http.ParseTime(v); err == nil {
+			return clampRetryAfter(time.Until(t).Seconds())
 		}
 	}
 	var parsed struct {
