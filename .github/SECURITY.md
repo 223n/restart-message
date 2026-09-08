@@ -66,19 +66,58 @@ Goツールチェーンや依存ライブラリ（`golang.org/x/sys`）に脆弱
   **管理者のみが書き込めるディレクトリ**（例として `C:\Program Files\restart-message\`）に配置してください。
 - 一般ユーザーが書き込めるパス（ダウンロードフォルダー、ユーザー領域の `bin\` など）からSYSTEMで実行しないでください。
 
-### ファイルの権限（ACL）
+### ファイルの権限（ACL） — 既定では一般ユーザーが `config.json` を読めます
 
 `%ProgramData%\restart-message\` 配下の `config.json`・`state.json`・`service.log` はSYSTEMが読み書きします。
-`%ProgramData%` のサブディレクトリは、作成方法によって一般ユーザーに書き込み権限が残ることがあります。
 
-- ディレクトリ作成後に、一般ユーザーの書き込み権限が付与されていないことを確認してください。
+**`restart-message` は、作成するディレクトリ・ファイルにACLを一切設定しません。**
+Goの `os.MkdirAll` / `os.WriteFile` にパーミッション値（`0o755` / `0o644`）を渡してはいますが、
+Windowsではディレクトリ作成時にセキュリティ記述子が渡されず、ファイル側も読み取り専用属性の
+判定にしか使われません。値を `0o600` に変えても、できあがるファイルは1バイトも変わりません。
+
+その結果、このディレクトリと配下のファイルは `C:\ProgramData` のACLを継承します。
+既定のWindowsでは `BUILTIN\Users` に `(OI)(CI)(RX)` が含まれるため、
+**何も対処せずに既定のまま配置した場合、Webhookトークンを含む `config.json` は
+そのPCの一般ユーザー全員が読み取れます。**
+READMEのインストール手順は、この継承を断ち切る `icacls` を最初の手順に含めています。
+Webhook URLは、それを知っている者が誰でも通知を投稿できる認証情報です。
+読み取れる者は、管理者が対応してしまうような「予期しないシャットダウン」や
+「ストップエラー(BSOD)」の偽の通知を、任意に送信できます。
+
+- **権限の設定は手作業です。** 次のようにディレクトリを作成し、継承を切ってください
+  （`restart-message` はこれを自動では行いません）。
+
+  ```powershell
+  New-Item -ItemType Directory -Force -Path 'C:\ProgramData\restart-message' | Out-Null
+  icacls 'C:\ProgramData\restart-message' /inheritance:r /grant:r 'BUILTIN\Administrators:(OI)(CI)F' 'NT AUTHORITY\SYSTEM:(OI)(CI)F'
+  ```
+
+  継承の解除（`/inheritance:r`）と許可の付与（`/grant:r`）は、**1回の `icacls` で行ってください**。
+  2回に分けると、その間ディレクトリのDACLが空になります。新規インストールでは
+  作成した管理者が所有者なので実害は出ませんが、再インストール時は
+  `state.json` / `service.log` をSYSTEMが作ったあとで所有者がSYSTEMになっており、
+  管理者の権限は今まさに消した継承ACEにしかありません。2つ目のコマンドが
+  アクセス拒否で失敗し、サービスからもツールからも使えないディレクトリが残ります。
+
+  タスクとサービスは `LocalSystem` で動くため、`SYSTEM` への許可が必要です。
+  `LocalSystem` のトークンには `BUILTIN\Administrators` も含まれますが、
+  それに頼らず明示的に付与してください。
+
+- 設定後、`BUILTIN\Users` の行が残っていないことを確認してください。
+  書き込み（`(W)`・`(M)`・`(F)`）だけでなく、**読み取り（`(R)`・`(RX)`）も残さない**でください。
 
   ```powershell
   icacls C:\ProgramData\restart-message
   ```
 
-- `config.json` には、Webhookのトークンが含まれます。
-  - 管理者のみが読み取れるように権限を絞ってください。
+- 権限を絞ったあとは、このディレクトリの `config.json` を読むサブコマンド
+  （`test` / `shutdown-notice` / `status`）も管理者権限で実行することになります。
+  一般ユーザーからは読み取り拒否になり、`restart-message` はそれを
+  「設定ファイルが無い」ではなくエラーとして扱います
+  （読めないファイルを黙って飛ばすと、Webhook URL なしの既定値で動いて
+  通知がどこにも飛ばないまま成功して見えるためです）。
+  `test` と `shutdown-notice` はそこで失敗し、`status` は警告を出したうえで
+  検知結果だけを表示します。
 
 ### Webhook URL は機密情報
 
@@ -97,21 +136,53 @@ Goツールチェーンや依存ライブラリ（`golang.org/x/sys`）に脆弱
 - `DISCORD_WEBHOOK_URL` でWebhookを、`RESTART_MESSAGE_CONFIG` で設定ファイルのパスを上書きできます。
 - システム環境変数の変更権限、およびタスク／サービス定義の変更権限は、管理者に限定してください。
 - これらを変更できる者は、送信先や設定を差し替えられます。
+- **Webhookトークンの保存先は `config.json` を推奨します。**
+  システム環境変数は一般ユーザー全員が読み取れ、そのPCで起動されるすべてのプロセスに
+  引き継がれます（子プロセスの環境からも漏れます）。
+  アクセス権を絞った `config.json` と違い、読める相手を選べません。
+- すでにシステム環境変数 `DISCORD_WEBHOOK_URL` で運用している場合（`install` /
+  `install-service` が拒否したときの「対処4」がこれにあたります）は、
+  **トークンがそのPCの全ユーザーから読める状態であることを承知のうえで**使ってください。
+  ツール側はユーザー環境変数とシステム環境変数を区別できないため、登録可否の判定からは
+  この変数を除外しています。そのうえで、設定済みの環境では `-allow-unconfigured` を
+  付ければ登録できる、と案内します。
 
 ### 配布バイナリの検証
 
-各リリースに添付される`SHA256SUMS.txt`と、ダウンロードしたファイルのハッシュが
-一致することを確認してください。
+**真正性は、ビルド来歴（provenance）の検証で確認してください。**
 
 ```powershell
 $exe = (Get-Item .\restart-message_*_windows_amd64.exe).FullName   # ARM64版は arm64
+gh attestation verify $exe --repo 223n/restart-message --signer-workflow 223n/restart-message/.github/workflows/release.yml
+```
+
+これが通ると、そのバイトがこのリポジトリの `release.yml` でビルドされたものであることが
+確認できます。それ以上のこと（内容が安全であること）は示しません。
+`gh` は認証済みであること（`gh auth login`）とネットワークが必要です
+（認証なしで動くのは、来歴を手元に持って `--bundle` で検証する場合だけです）。
+
+`--signer-workflow` を省くと、検証されるのは「このリポジトリが発行元であること」までで、
+**どのワークフローが署名したかは固定されません**。現状 `attestations: write` を持つ
+ワークフローは `release.yml` だけですが、それはこのコマンドが確かめている内容ではないため、
+確かめたいなら明示します。
+
+`SHA256SUMS.txt` との照合は、**ダウンロードの破損・切れを見つけるための確認**です。
+リリースの資産そのものを差し替えられる攻撃者に対しては、改ざんを検知できません。
+`SHA256SUMS.txt` 自身にはハッシュも署名もなく、
+provenance の対象（`release.yml` の `subject-path`）は2つの実行ファイルだけで、
+この一覧ファイルは含まれていないためです。
+リリースの資産を差し替えられる相手は、一覧の方も同時に書き換えられます。
+逆に、一覧まで書き換えられない相手（経路上での差し替えや壊れたミラーなど）であれば、
+この照合でも食い違いに気づけます。その代わり、`gh` もネットワークも不要です。
+
+```powershell
 (Get-FileHash $exe -Algorithm SHA256).Hash
 ```
 
-一致しない場合は使用せず、報告してください。
+来歴の検証に失敗した場合は使用せず、報告してください。
+ハッシュが一致しない場合は、まずダウンロードし直してください。
 
-ビルド来歴（provenance）の検証を含む詳しい手順は、[README](../README.md)の
-「ダウンロードと検証」を参照してください。
+手順の全文は、[README](../README.md)の「ダウンロードと検証」を参照してください。
 
 ### 送信される情報
 
@@ -133,6 +204,8 @@ $exe = (Get-Item .\restart-message_*_windows_amd64.exe).FullName   # ARM64版は
 
 - `uninstall` / `uninstall-service` はタスク／サービスのみを削除し、
   `%ProgramData%\restart-message\` 配下の `config.json`（Webhookトークンを含む）・`state.json`・`service.log` は残します。
+- `DISCORD_WEBHOOK_URL` / `RESTART_MESSAGE_CONFIG` を環境変数で設定していた場合、
+  これらも削除されません。ファイルを消してもトークンがPCに残るため、環境変数も消してください。
 - 不要になった場合は `config.json` を削除し、Discord側でWebhookを再生成（無効化）してください。
 
 ## 対象外（既知の仕様・制限）
